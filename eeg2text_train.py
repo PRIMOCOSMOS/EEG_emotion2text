@@ -96,6 +96,13 @@ def run_epoch(
             break
 
         eeg = batch["eeg"].to(device, non_blocking=True)
+        labels = batch["label"].to(device, non_blocking=True)
+
+        if not torch.isfinite(eeg).all():
+            raise RuntimeError("Found non-finite EEG values in batch.")
+        if int(labels.min().item()) < 0 or int(labels.max().item()) >= 7:
+            raise RuntimeError(f"Label out of range [0,6], got min={int(labels.min().item())}, max={int(labels.max().item())}")
+
         with torch.set_grad_enabled(train_mode):
             with torch.cuda.amp.autocast(enabled=(cfg.amp and device.type == "cuda")):
                 eeg_z = eeg_model(eeg)
@@ -111,7 +118,7 @@ def run_epoch(
                     txt_z,
                     cfg.temperature,
                     cfg.alpha,
-                    batch["label"].to(device),
+                    labels,
                     same_emotion_weight=cfg.same_emotion_weight,
                     pos_neg_margin=cfg.pos_neg_margin,
                     margin_loss_weight=cfg.margin_loss_weight,
@@ -307,10 +314,39 @@ def train_one_fold(
 
 
 def run_loso(cfg: CFG, run_all_folds: bool = False):
+    if cfg.cuda_launch_blocking:
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
     seed_everything(cfg.seed)
     ensure_work_dir(cfg.work_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if device.type == "cuda":
+        # Some Kaggle GPU/runtime combos may fail on flash/mem-efficient SDP kernels.
+        # Force math kernel for stability.
+        if cfg.force_math_sdp and hasattr(torch.backends, "cuda"):
+            try:
+                torch.backends.cuda.enable_flash_sdp(False)
+                torch.backends.cuda.enable_mem_efficient_sdp(False)
+                torch.backends.cuda.enable_math_sdp(True)
+                print("SDP backend: flash=False, mem_efficient=False, math=True")
+            except Exception as e:
+                print("SDP backend setup skipped:", e)
+
+        # Quick CUDA smoke test to fail early with a clearer message.
+        try:
+            x = torch.randn(8, 8, device=device)
+            y = torch.randn(8, 8, device=device)
+            _ = (x @ y).mean().item()
+        except Exception as e:
+            msg = str(e)
+            if "no kernel image is available" in msg:
+                raise RuntimeError(
+                    "Detected CUDA kernel-image mismatch. Try another Kaggle GPU type (T4), "
+                    "or run on CPU, or use a Torch build compatible with this GPU architecture."
+                ) from e
+            raise
 
     def _discover_data_paths():
         # Support Kaggle layout like:

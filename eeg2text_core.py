@@ -244,7 +244,7 @@ class CFG:
     lr: float = 2e-4
     weight_decay: float = 1e-4
     num_workers: int = 2
-    amp: bool = True
+    amp: bool = False
     val_ratio: float = 0.1
     seed: int = 42
 
@@ -265,6 +265,8 @@ class CFG:
     same_emotion_weight: float = 1.0
     pos_neg_margin: float = 0.20
     margin_loss_weight: float = 0.20
+    cuda_launch_blocking: bool = False
+    force_math_sdp: bool = True
 
 
 def find_subject_files(data_root: str) -> List[Path]:
@@ -343,6 +345,9 @@ def load_all_samples_with_saveinfo(data_root: str, saveinfo_dir: Optional[str] =
     subject_files = find_subject_files(data_root)
     if len(subject_files) == 0:
         raise FileNotFoundError(f"未找到 subject_*.mat: {data_root}")
+
+    saveinfo_files = find_saveinfo_files(data_root, saveinfo_dir=saveinfo_dir)
+    print(f"save_info files detected: {len(saveinfo_files)}")
 
     subject_label_map = build_subject_label_map_from_saveinfo(data_root, saveinfo_dir=saveinfo_dir, n_trials=80)
     print(f"saveinfo subjects parsed: {len(subject_label_map)} from {saveinfo_dir if saveinfo_dir else data_root}")
