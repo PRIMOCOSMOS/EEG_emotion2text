@@ -604,17 +604,9 @@ def build_similarity_targets(
     # Updated rule:
     # same emotion -> positive
     # different emotion -> negative
-    bsz = int(labels.shape[0])
-    sim = torch.zeros((bsz, bsz), dtype=torch.float32, device=device)
-
-    for i in range(bsz):
-        for j in range(bsz):
-            same_emotion = int(labels[i].item()) == int(labels[j].item())
-
-            if same_emotion:
-                sim[i, j] = same_emotion_weight
-            else:
-                sim[i, j] = 0.0
+    lbl = labels.view(-1)
+    same = (lbl.unsqueeze(1) == lbl.unsqueeze(0)).to(torch.float32)
+    sim = same * float(same_emotion_weight)
 
     # Row-wise normalization to valid probability distribution.
     row_sum = sim.sum(dim=1, keepdim=True)
@@ -656,29 +648,17 @@ def asymmetric_soft_contrastive_loss(
     loss_e2t = soft_cross_entropy(logits, target_e2t)
     loss_t2e = soft_cross_entropy(logits.t(), target_t2e)
 
-    # Margin term: same-emotion pairs should be closer than different-emotion pairs.
+    # Margin term (vectorized): same-emotion similarity should exceed different-emotion similarity.
     sim = eeg_z @ txt_z.t()
-    bsz = sim.size(0)
-    margin_terms = []
-    for i in range(bsz):
-        label_i = int(labels[i].item())
-        pos_mask = torch.tensor(
-            [int(labels[j].item()) == label_i for j in range(bsz)],
-            dtype=torch.bool,
-            device=sim.device,
-        )
-        neg_mask = torch.tensor(
-            [int(labels[j].item()) != label_i for j in range(bsz)],
-            dtype=torch.bool,
-            device=sim.device,
-        )
+    lbl = labels.view(-1)
+    pos_mask = (lbl.unsqueeze(1) == lbl.unsqueeze(0)).to(sim.dtype)
+    neg_mask = 1.0 - pos_mask
 
-        s_pos = sim[i][pos_mask].mean() if pos_mask.any() else sim[i, i]
-        s_neg = sim[i][neg_mask].mean() if neg_mask.any() else (s_pos - 1.0)
-
-        margin_terms.append(F.relu(pos_neg_margin - (s_pos - s_neg)))
-
-    margin_loss = torch.stack(margin_terms).mean() if len(margin_terms) > 0 else torch.tensor(0.0, device=sim.device)
+    pos_cnt = pos_mask.sum(dim=1).clamp_min(1.0)
+    neg_cnt = neg_mask.sum(dim=1).clamp_min(1.0)
+    s_pos = (sim * pos_mask).sum(dim=1) / pos_cnt
+    s_neg = (sim * neg_mask).sum(dim=1) / neg_cnt
+    margin_loss = F.relu(pos_neg_margin - (s_pos - s_neg)).mean()
 
     base_loss = alpha * loss_e2t + (1.0 - alpha) * loss_t2e
     loss = base_loss + margin_loss_weight * margin_loss
