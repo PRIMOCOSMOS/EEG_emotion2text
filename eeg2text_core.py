@@ -80,6 +80,29 @@ def _extract_subject_id(text: str) -> Optional[int]:
     return int(nums[0])
 
 
+def _normalize_kaggle_input_path(path_str: str) -> str:
+    # Some users pass paths like /kaggle/input/datasets/<owner>/<dataset>/...
+    # while Kaggle runtime often mounts as /kaggle/input/<dataset>/...
+    p = Path(path_str)
+    if p.exists():
+        return str(p)
+
+    parts = [x for x in p.parts if x]
+    try:
+        idx = parts.index("datasets")
+        if idx + 2 < len(parts):
+            dataset = parts[idx + 2]
+            tail = parts[idx + 3 :]
+            alt = Path("/") / "kaggle" / "input" / dataset
+            for t in tail:
+                alt = alt / t
+            if alt.exists():
+                return str(alt)
+    except ValueError:
+        pass
+    return str(p)
+
+
 def _extract_emotion_from_video_path(video_path: str) -> str:
     parts = [p for p in re.split(r"[\\/]", video_path) if p]
     if len(parts) < 2:
@@ -108,9 +131,9 @@ def load_saveinfo_trial_labels(saveinfo_csv: str, n_trials: Optional[int] = 80) 
 
 def find_saveinfo_files(data_root: str, saveinfo_dir: Optional[str] = None) -> List[Path]:
     if saveinfo_dir:
-        root = Path(saveinfo_dir)
+        root = Path(_normalize_kaggle_input_path(saveinfo_dir))
     else:
-        root = Path(data_root)
+        root = Path(_normalize_kaggle_input_path(data_root))
     files = []
     files.extend(sorted(root.rglob("*_save_info.csv")))
     files.extend(sorted(root.rglob("*save*info*.csv")))
@@ -154,7 +177,7 @@ def build_subject_label_map_from_saveinfo(data_root: str, saveinfo_dir: Optional
             merged.extend(arr.tolist())
             if len(merged) >= n_trials:
                 break
-        if len(merged) >= n_trials:
+        if len(merged) > 0:
             subject_label_map[sid] = np.array(merged[:n_trials], dtype=np.int64)
     return subject_label_map
 
@@ -245,7 +268,7 @@ class CFG:
 
 
 def find_subject_files(data_root: str) -> List[Path]:
-    root = Path(data_root)
+    root = Path(_normalize_kaggle_input_path(data_root))
     mats = sorted(root.rglob("*.mat"))
     subject_files = []
     for p in mats:
@@ -262,7 +285,7 @@ def find_subject_files(data_root: str) -> List[Path]:
 
 
 def load_trial_labels(data_root: str, n_trials: int = 80) -> np.ndarray:
-    root = Path(data_root)
+    root = Path(_normalize_kaggle_input_path(data_root))
     candidate = list(root.rglob("*label*.mat"))
     for p in candidate:
         obj = sio.loadmat(p)
@@ -313,11 +336,16 @@ def load_all_samples(data_root: str) -> List[Dict]:
 
 
 def load_all_samples_with_saveinfo(data_root: str, saveinfo_dir: Optional[str] = None) -> List[Dict]:
+    data_root = _normalize_kaggle_input_path(data_root)
+    if saveinfo_dir:
+        saveinfo_dir = _normalize_kaggle_input_path(saveinfo_dir)
+
     subject_files = find_subject_files(data_root)
     if len(subject_files) == 0:
         raise FileNotFoundError(f"未找到 subject_*.mat: {data_root}")
 
     subject_label_map = build_subject_label_map_from_saveinfo(data_root, saveinfo_dir=saveinfo_dir, n_trials=80)
+    print(f"saveinfo subjects parsed: {len(subject_label_map)} from {saveinfo_dir if saveinfo_dir else data_root}")
     fallback_labels = None
 
     all_samples = []
