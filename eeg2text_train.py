@@ -31,6 +31,7 @@ def build_loaders(
     l1_texts: Dict[str, str],
     l2_texts: Dict[int, str],
 ) -> Tuple[DataLoader, DataLoader]:
+    use_pin_memory = torch.cuda.is_available()
     train_ds = EEGTextWindowDataset(train_rows, l1_texts=l1_texts, l2_texts=l2_texts)
     val_ds = EEGTextWindowDataset(val_rows, l1_texts=l1_texts, l2_texts=l2_texts)
     train_loader = DataLoader(
@@ -38,7 +39,7 @@ def build_loaders(
         batch_size=cfg.batch_size,
         shuffle=True,
         num_workers=cfg.num_workers,
-        pin_memory=True,
+        pin_memory=use_pin_memory,
         collate_fn=collate_fn,
         drop_last=True,
     )
@@ -47,7 +48,7 @@ def build_loaders(
         batch_size=cfg.batch_size,
         shuffle=False,
         num_workers=cfg.num_workers,
-        pin_memory=True,
+        pin_memory=use_pin_memory,
         collate_fn=collate_fn,
         drop_last=False,
     )
@@ -88,6 +89,8 @@ def run_epoch(
     total_acc = 0.0
     n_steps = 0
     timed_out = False
+    epoch_start = time.monotonic()
+    samples_processed = 0
 
     for batch in loader:
         now = time.monotonic()
@@ -95,6 +98,7 @@ def run_epoch(
             timed_out = True
             break
 
+        # Move data to device
         eeg = batch["eeg"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
 
@@ -148,6 +152,21 @@ def run_epoch(
         total_loss += loss.item()
         total_acc += metrics["batch_retrieval_acc"]
         n_steps += 1
+        samples_processed += eeg.size(0)
+
+        if train_mode and (n_steps == 1 or n_steps % max(1, cfg.log_every_n_steps) == 0):
+            elapsed = time.monotonic() - epoch_start
+            throughput = samples_processed / elapsed if elapsed > 0 else 0
+            gpu_mem = ""
+            if device.type == "cuda":
+                mem_alloc = torch.cuda.memory_allocated(device) / 1e9
+                mem_res = torch.cuda.memory_reserved(device) / 1e9
+                gpu_mem = f" GPUmem={mem_alloc:.2f}/{mem_res:.2f}GB"
+            print(
+                f"step={n_steps} global_step={global_step} "
+                f"loss={loss.item():.4f} acc={metrics['batch_retrieval_acc']:.4f} "
+                f"samples/s={throughput:.1f}{gpu_mem}"
+            )
 
     if n_steps == 0:
         stats = {"loss": float("nan"), "retrieval_acc": float("nan")}
@@ -167,7 +186,9 @@ def train_one_fold(
     l2_texts: Dict[int, str],
 ):
     ensure_work_dir(cfg.work_dir)
+    print(f"[Init] building dataloaders, num_workers={cfg.num_workers}, batch_size={cfg.batch_size}")
     train_loader, val_loader = build_loaders(train_rows, val_rows, cfg, l1_texts=l1_texts, l2_texts=l2_texts)
+    print(f"[Init] dataloaders ready, train_steps={len(train_loader)}, val_steps={len(val_loader)}")
 
     eeg_model = EEGEncoder(
         f1=cfg.f1,
@@ -178,7 +199,9 @@ def train_one_fold(
         drop_conv=cfg.drop_conv,
         drop_attn=cfg.drop_attn,
     ).to(device)
+    print("[Init] EEG model ready")
     text_model = TextTower(cfg.clip_name, embed_dim=cfg.embed_dim, max_len=cfg.max_text_len).to(device)
+    print("[Init] Text model ready")
 
     params = list(eeg_model.parameters()) + list(text_model.proj.parameters())
     optimizer = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -323,6 +346,11 @@ def run_loso(cfg: CFG, run_all_folds: bool = False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if device.type == "cuda":
+        gpu_name = torch.cuda.get_device_name(0)
+        cap = torch.cuda.get_device_capability(0)
+        print(f"GPU: {gpu_name}, Capability: sm_{cap[0]}{cap[1]}")
+        print(f"CUDA Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        
         # Some Kaggle GPU/runtime combos may fail on flash/mem-efficient SDP kernels.
         # Force math kernel for stability.
         if cfg.force_math_sdp and hasattr(torch.backends, "cuda"):
@@ -336,9 +364,10 @@ def run_loso(cfg: CFG, run_all_folds: bool = False):
 
         # Quick CUDA smoke test to fail early with a clearer message.
         try:
-            x = torch.randn(8, 8, device=device)
-            y = torch.randn(8, 8, device=device)
+            x = torch.randn(512, 512, device=device)
+            y = torch.randn(512, 512, device=device)
             _ = (x @ y).mean().item()
+            print("CUDA smoke test: PASSED")
         except Exception as e:
             msg = str(e)
             if "no kernel image is available" in msg:

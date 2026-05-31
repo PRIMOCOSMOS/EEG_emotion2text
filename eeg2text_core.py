@@ -267,6 +267,7 @@ class CFG:
     margin_loss_weight: float = 0.20
     cuda_launch_blocking: bool = False
     force_math_sdp: bool = True
+    log_every_n_steps: int = 20
 
 
 def find_subject_files(data_root: str) -> List[Path]:
