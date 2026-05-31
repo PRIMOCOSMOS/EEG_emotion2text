@@ -12,17 +12,21 @@ from eeg2text_core import (
     EEGTextWindowDataset,
     TextTower,
     asymmetric_contrastive_loss,
+    build_trial_texts,
     collate_fn,
     ensure_work_dir,
-    load_all_samples,
+    load_all_samples_with_saveinfo,
+    load_trial_texts_from_csv,
     seed_everything,
     split_train_val,
 )
 
 
-def build_loaders(train_rows: List[Dict], val_rows: List[Dict], cfg: CFG) -> Tuple[DataLoader, DataLoader]:
-    train_ds = EEGTextWindowDataset(train_rows)
-    val_ds = EEGTextWindowDataset(val_rows)
+def build_loaders(
+    train_rows: List[Dict], val_rows: List[Dict], cfg: CFG, trial_texts: Dict[int, Dict[str, str]]
+) -> Tuple[DataLoader, DataLoader]:
+    train_ds = EEGTextWindowDataset(train_rows, trial_texts=trial_texts)
+    val_ds = EEGTextWindowDataset(val_rows, trial_texts=trial_texts)
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
@@ -125,9 +129,16 @@ def run_epoch(
     return stats, timed_out, global_step
 
 
-def train_one_fold(train_rows: List[Dict], val_rows: List[Dict], fold_name: str, cfg: CFG, device: torch.device):
+def train_one_fold(
+    train_rows: List[Dict],
+    val_rows: List[Dict],
+    fold_name: str,
+    cfg: CFG,
+    device: torch.device,
+    trial_texts: Dict[int, Dict[str, str]],
+):
     ensure_work_dir(cfg.work_dir)
-    train_loader, val_loader = build_loaders(train_rows, val_rows, cfg)
+    train_loader, val_loader = build_loaders(train_rows, val_rows, cfg, trial_texts=trial_texts)
 
     eeg_model = EEGEncoder(
         f1=cfg.f1,
@@ -278,7 +289,14 @@ def run_loso(cfg: CFG, run_all_folds: bool = False):
     ensure_work_dir(cfg.work_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    all_rows = load_all_samples(cfg.data_root)
+    if cfg.text_csv_path and os.path.exists(cfg.text_csv_path):
+        trial_texts = load_trial_texts_from_csv(cfg.text_csv_path, n_trials=80)
+        print("loaded text protocol csv:", cfg.text_csv_path)
+    else:
+        trial_texts = build_trial_texts(80)
+        print("text protocol csv not found, fallback to template text.")
+
+    all_rows = load_all_samples_with_saveinfo(cfg.data_root, saveinfo_dir=cfg.saveinfo_dir)
     subjects = sorted(list({r["subject"] for r in all_rows}))
 
     target_subjects = subjects if run_all_folds else subjects[:1]
@@ -296,7 +314,7 @@ def run_loso(cfg: CFG, run_all_folds: bool = False):
         print("\n===", fold_name, "===")
         print("train/val/test =", len(train_rows), len(val_rows), len(test_rows))
 
-        fold_result = train_one_fold(train_rows, val_rows, fold_name, cfg, device)
+        fold_result = train_one_fold(train_rows, val_rows, fold_name, cfg, device, trial_texts)
         fold_results.append(fold_result)
 
     result_path = os.path.join(cfg.work_dir, "loso_results.json")

@@ -1,8 +1,10 @@
 import os
 import random
+import csv
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import scipy.io as sio
@@ -48,6 +50,111 @@ def build_trial_texts(n_trials: int = 80) -> Dict[int, Dict[str, str]]:
 
 TRIAL_TEXTS = build_trial_texts(80)
 
+EMOTION_ALIASES = {
+    "neutral": "neutral",
+    "calm": "neutral",
+    "happy": "joy",
+    "joy": "joy",
+    "sad": "sadness",
+    "sadness": "sadness",
+    "fear": "fear",
+    "disgust": "disgust",
+    "anger": "anger",
+    "angry": "anger",
+    "surprise": "surprise",
+}
+
+
+def normalize_emotion_name(raw: str) -> str:
+    key = (raw or "").strip().lower()
+    key = key.replace(" ", "")
+    return EMOTION_ALIASES.get(key, "neutral")
+
+
+def emotion_name_to_label(name: str) -> int:
+    norm = normalize_emotion_name(name)
+    return EMOTION_NAMES.index(norm)
+
+
+def _extract_subject_id(text: str) -> Optional[int]:
+    nums = re.findall(r"\d+", text)
+    if not nums:
+        return None
+    return int(nums[0])
+
+
+def _extract_emotion_from_video_path(video_path: str) -> str:
+    parts = [p for p in re.split(r"[\\/]", video_path) if p]
+    if len(parts) < 2:
+        return "neutral"
+    # 形如 movie\七类\1\happy\x.mp4 -> 倒数第二段是情绪
+    return normalize_emotion_name(parts[-2])
+
+
+def load_saveinfo_trial_labels(saveinfo_csv: str, n_trials: int = 80) -> np.ndarray:
+    labels = []
+    with open(saveinfo_csv, "r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if len(row) < 2:
+                continue
+            emotion = _extract_emotion_from_video_path(row[1])
+            labels.append(emotion_name_to_label(emotion))
+
+    if len(labels) < n_trials:
+        raise ValueError(f"Saveinfo 行数不足: {saveinfo_csv}, got={len(labels)}, expected>={n_trials}")
+    return np.array(labels[:n_trials], dtype=np.int64)
+
+
+def find_saveinfo_files(data_root: str, saveinfo_dir: Optional[str] = None) -> List[Path]:
+    if saveinfo_dir:
+        root = Path(saveinfo_dir)
+    else:
+        root = Path(data_root)
+    return sorted(root.rglob("*_save_info.csv"))
+
+
+def build_subject_label_map_from_saveinfo(data_root: str, saveinfo_dir: Optional[str] = None, n_trials: int = 80):
+    saveinfo_files = find_saveinfo_files(data_root, saveinfo_dir)
+    subject_label_map: Dict[int, np.ndarray] = {}
+    for fp in saveinfo_files:
+        sid = _extract_subject_id(fp.stem)
+        if sid is None:
+            continue
+        try:
+            subject_label_map[sid] = load_saveinfo_trial_labels(str(fp), n_trials=n_trials)
+        except Exception:
+            continue
+    return subject_label_map
+
+
+def load_trial_texts_from_csv(text_csv_path: str, n_trials: int = 80) -> Dict[int, Dict[str, str]]:
+    # 协议: 至少包含 trial 列，可选 emotion,l1_text,l2_text,l3_text
+    # 若缺失文本列，使用默认模板自动补齐。
+    trial_texts = build_trial_texts(n_trials)
+    with open(text_csv_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if "trial" not in row:
+                continue
+            try:
+                trial = int(row["trial"])
+            except Exception:
+                continue
+            if trial < 1 or trial > n_trials:
+                continue
+
+            emotion = normalize_emotion_name(row.get("emotion", "neutral"))
+            l1 = row.get("l1_text", "").strip() or L1_PROTOTYPE[emotion]
+            l2 = row.get("l2_text", "").strip() or trial_texts[trial]["level2"]
+            l3 = row.get("l3_text", "").strip() or trial_texts[trial]["level3"]
+            trial_texts[trial] = {"level2": l2, "level3": l3, "level1": l1}
+
+    for t in range(1, n_trials + 1):
+        if "level1" not in trial_texts[t]:
+            trial_texts[t]["level1"] = L1_PROTOTYPE["neutral"]
+    return trial_texts
+
 
 @dataclass
 class CFG:
@@ -82,6 +189,8 @@ class CFG:
     save_every_n_steps: int = 100
     max_train_hours: float = 8.8
     time_buffer_minutes: int = 8
+    saveinfo_dir: Optional[str] = None
+    text_csv_path: Optional[str] = None
 
     # Text encoder
     clip_name: str = "openai/clip-vit-large-patch14"
@@ -147,20 +256,33 @@ def load_subject_windows(subject_file: Path, trial_labels: np.ndarray) -> List[D
 
 
 def load_all_samples(data_root: str) -> List[Dict]:
+    return load_all_samples_with_saveinfo(data_root=data_root, saveinfo_dir=None)
+
+
+def load_all_samples_with_saveinfo(data_root: str, saveinfo_dir: Optional[str] = None) -> List[Dict]:
     subject_files = find_subject_files(data_root)
     if len(subject_files) == 0:
         raise FileNotFoundError(f"未找到 subject_*.mat: {data_root}")
 
-    labels = load_trial_labels(data_root, n_trials=80)
+    subject_label_map = build_subject_label_map_from_saveinfo(data_root, saveinfo_dir=saveinfo_dir, n_trials=80)
+    fallback_labels = None
+
     all_samples = []
     for sf in subject_files:
+        sid = _extract_subject_id(sf.stem)
+        labels = subject_label_map.get(sid)
+        if labels is None:
+            if fallback_labels is None:
+                fallback_labels = load_trial_labels(data_root, n_trials=80)
+            labels = fallback_labels
         all_samples.extend(load_subject_windows(sf, labels))
     return all_samples
 
 
 class EEGTextWindowDataset(Dataset):
-    def __init__(self, rows: List[Dict]):
+    def __init__(self, rows: List[Dict], trial_texts: Optional[Dict[int, Dict[str, str]]] = None):
         self.rows = rows
+        self.trial_texts = trial_texts if trial_texts is not None else TRIAL_TEXTS
 
     def __len__(self):
         return len(self.rows)
@@ -170,14 +292,15 @@ class EEGTextWindowDataset(Dataset):
         x = torch.tensor(row["eeg"], dtype=torch.float32)
         trial = row["trial"]
         emotion = EMOTION_NAMES[int(row["label"])]
+        ttxt = self.trial_texts.get(trial, {})
         return {
             "eeg": x,
             "label": torch.tensor(row["label"], dtype=torch.long),
             "subject": row["subject"],
             "trial": trial,
-            "text_l1": L1_PROTOTYPE[emotion],
-            "text_l2": TRIAL_TEXTS[trial]["level2"],
-            "text_l3": TRIAL_TEXTS[trial]["level3"],
+            "text_l1": ttxt.get("level1", L1_PROTOTYPE[emotion]),
+            "text_l2": ttxt.get("level2", TRIAL_TEXTS[trial]["level2"]),
+            "text_l3": ttxt.get("level3", TRIAL_TEXTS[trial]["level3"]),
         }
 
 
@@ -286,9 +409,11 @@ class TextTower(nn.Module):
         self.tokenizer = CLIPTokenizer.from_pretrained(clip_name)
         self.encoder = CLIPTextModel.from_pretrained(clip_name)
         self.max_len = max_len
+        self.cache: Dict[str, torch.Tensor] = {}
 
         for p in self.encoder.parameters():
             p.requires_grad = False
+        self.encoder.eval()
 
         hidden = self.encoder.config.hidden_size
         self.proj = nn.Sequential(
@@ -300,16 +425,30 @@ class TextTower(nn.Module):
 
     @torch.no_grad()
     def _encode_text(self, texts: List[str], dev: torch.device) -> torch.Tensor:
-        tok = self.tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_len,
-            return_tensors="pt",
-        )
-        tok = {k: v.to(dev) for k, v in tok.items()}
-        out = self.encoder(**tok)
-        return out.pooler_output
+        self.encoder.eval()
+        out_feats: List[torch.Tensor] = []
+        uncached: List[str] = []
+        for t in texts:
+            if t not in self.cache:
+                uncached.append(t)
+
+        if uncached:
+            tok = self.tokenizer(
+                uncached,
+                padding=True,
+                truncation=True,
+                max_length=self.max_len,
+                return_tensors="pt",
+            )
+            tok = {k: v.to(dev) for k, v in tok.items()}
+            feats = self.encoder(**tok).pooler_output.detach().float().cpu()
+            for t, f in zip(uncached, feats):
+                self.cache[t] = f
+
+        for t in texts:
+            out_feats.append(self.cache[t])
+
+        return torch.stack(out_feats, dim=0).to(dev)
 
     def forward(self, text_l1: List[str], text_l2: List[str], text_l3: List[str], dev: torch.device) -> torch.Tensor:
         f1 = self._encode_text(text_l1, dev)
