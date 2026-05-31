@@ -132,3 +132,5 @@ surprise,This EEG window reflects surprised affective evidence.,,
 2. 支持续训：`resume=True` 自动加载 latest。
 3. 支持最大训练时长：`max_train_hours` + `time_buffer_minutes`，在被 Kaggle 强制结束前主动退出并落盘。
 4. 输出目录：`/kaggle/working/eeg2text_ckpt`。
+5. 推荐数据结构：`/kaggle/input/<dataset>/{EEG_features, save_info, Emotion2text}`。
+6. 代码会优先按配置路径读取，若路径不存在会自动发现 `EEG_features`、`save_info` 和 `Emotion2text/*.csv`。

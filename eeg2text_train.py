@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
@@ -310,7 +311,46 @@ def run_loso(cfg: CFG, run_all_folds: bool = False):
     ensure_work_dir(cfg.work_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    text_csv_path = cfg.l1_l2_text_csv_path or cfg.text_csv_path
+
+    def _discover_data_paths():
+        # Support Kaggle layout like:
+        # /kaggle/input/<dataset>/{EEG_features, save_info, Emotion2text}
+        data_root = cfg.data_root
+        saveinfo_dir = cfg.saveinfo_dir
+        text_csv_path = cfg.l1_l2_text_csv_path or cfg.text_csv_path
+
+        input_root = Path("/kaggle/input")
+        if input_root.exists():
+            feature_dirs = sorted(input_root.rglob("EEG_features"))
+            if (not os.path.exists(data_root)) and len(feature_dirs) > 0:
+                data_root = str(feature_dirs[0])
+
+            if (not saveinfo_dir or not os.path.exists(saveinfo_dir)) and os.path.exists(data_root):
+                parent = Path(data_root).parent
+                cands = [parent / "save_info", parent / "Saveinfo", parent / "saveinfo"]
+                for c in cands:
+                    if c.exists():
+                        saveinfo_dir = str(c)
+                        break
+
+            if (not text_csv_path or not os.path.exists(text_csv_path)) and os.path.exists(data_root):
+                parent = Path(data_root).parent
+                cands = []
+                emo_dir = parent / "Emotion2text"
+                if emo_dir.exists():
+                    cands.extend(sorted(emo_dir.glob("*.csv")))
+                cands.extend(sorted(parent.glob("*text*protocol*.csv")))
+                cands.extend(sorted(parent.rglob("text_protocol*.csv")))
+                if len(cands) > 0:
+                    text_csv_path = str(cands[0])
+
+        return data_root, saveinfo_dir, text_csv_path
+
+    data_root, saveinfo_dir, text_csv_path = _discover_data_paths()
+    print("resolved data_root:", data_root)
+    print("resolved saveinfo_dir:", saveinfo_dir)
+    print("resolved text_csv_path:", text_csv_path)
+
     if text_csv_path and os.path.exists(text_csv_path):
         l1_texts, l2_texts = load_two_level_texts_from_csv(text_csv_path, n_trials=80)
         print("loaded two-level text protocol csv:", text_csv_path)
@@ -319,7 +359,7 @@ def run_loso(cfg: CFG, run_all_folds: bool = False):
         l2_texts = build_default_l2_texts(80)
         print("text protocol csv not found, fallback to template text.")
 
-    all_rows = load_all_samples_with_saveinfo(cfg.data_root, saveinfo_dir=cfg.saveinfo_dir)
+    all_rows = load_all_samples_with_saveinfo(data_root, saveinfo_dir=saveinfo_dir)
     subjects = sorted(list({r["subject"] for r in all_rows}))
 
     target_subjects = subjects if run_all_folds else subjects[:1]

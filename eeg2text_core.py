@@ -108,7 +108,19 @@ def find_saveinfo_files(data_root: str, saveinfo_dir: Optional[str] = None) -> L
         root = Path(saveinfo_dir)
     else:
         root = Path(data_root)
-    return sorted(root.rglob("*_save_info.csv"))
+    files = []
+    files.extend(sorted(root.rglob("*_save_info.csv")))
+    files.extend(sorted(root.rglob("*save*info*.csv")))
+    files.extend(sorted(root.rglob("*.CSV")))
+    seen = set()
+    uniq = []
+    for p in files:
+        sp = str(p)
+        if sp in seen:
+            continue
+        seen.add(sp)
+        uniq.append(p)
+    return uniq
 
 
 def build_subject_label_map_from_saveinfo(data_root: str, saveinfo_dir: Optional[str] = None, n_trials: int = 80):
@@ -134,18 +146,24 @@ def load_two_level_texts_from_csv(text_csv_path: str, n_trials: int = 80):
     l1_texts = build_default_l1_texts()
     l2_texts = build_default_l2_texts(n_trials)
 
+    def _get(row: Dict[str, str], keys: List[str]) -> str:
+        for k in keys:
+            if k in row and row[k] is not None:
+                return str(row[k])
+        return ""
+
     with open(text_csv_path, "r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            emo_raw = (row.get("emotion", "") or "").strip().lower()
-            l1_raw = (row.get("l1_text", "") or "").strip()
+            emo_raw = (_get(row, ["emotion", "Emotion", "emo", "label"]) or "").strip().lower()
+            l1_raw = (_get(row, ["l1_text", "L1_text", "l1", "L1", "window_text"]) or "").strip()
             if l1_raw:
                 if emo_raw:
                     emo = normalize_emotion_name(emo_raw)
                     l1_texts[emo] = l1_raw
 
-            trial_raw = (row.get("trial", "") or "").strip()
-            l2_raw = (row.get("l2_text", "") or "").strip()
+            trial_raw = (_get(row, ["trial", "Trial", "trial_id", "id"]) or "").strip()
+            l2_raw = (_get(row, ["l2_text", "L2_text", "l2", "L2", "trial_text", "description"]) or "").strip()
             if trial_raw and l2_raw:
                 try:
                     trial = int(trial_raw)
@@ -159,7 +177,7 @@ def load_two_level_texts_from_csv(text_csv_path: str, n_trials: int = 80):
 
 @dataclass
 class CFG:
-    data_root: str = "/kaggle/input/seed-vii-eeg-feature"
+    data_root: str = "/kaggle/input/eeg-emotion2text/EEG_features"
     work_dir: str = "/kaggle/working/eeg2text_ckpt"
 
     # Model
@@ -190,9 +208,9 @@ class CFG:
     save_every_n_steps: int = 100
     max_train_hours: float = 8.8
     time_buffer_minutes: int = 8
-    saveinfo_dir: Optional[str] = None
+    saveinfo_dir: Optional[str] = "/kaggle/input/eeg-emotion2text/save_info"
     text_csv_path: Optional[str] = None
-    l1_l2_text_csv_path: Optional[str] = None
+    l1_l2_text_csv_path: Optional[str] = "/kaggle/input/eeg-emotion2text/Emotion2text/text_protocol_template.csv"
 
     # Text encoder
     clip_name: str = "openai/clip-vit-large-patch14"
@@ -211,6 +229,12 @@ def find_subject_files(data_root: str) -> List[Path]:
     for p in mats:
         name = p.stem.lower()
         if "subject" in name or "sub" in name:
+            subject_files.append(p)
+    if len(subject_files) == 0:
+        for p in mats:
+            name = p.stem.lower()
+            if "label" in name or "readme" in name:
+                continue
             subject_files.append(p)
     return subject_files
 
