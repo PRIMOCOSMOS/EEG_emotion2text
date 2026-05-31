@@ -31,8 +31,9 @@ Saveinfo/*.csv  (例如: 1_20221001_1_save_info.csv)
 解析规则：
 1. 从第二列视频路径提取情绪目录（如 `happy`）。
 2. 映射到七类标签：neutral / joy / sadness / fear / disgust / anger / surprise。
-3. 每个被试取前 80 行作为 trial 标签。
+3. 对同一被试的多个 `*_save_info` 文件按文件名排序后拼接，再取前 80 行作为 trial 标签。
 4. 若某被试缺少 Saveinfo 文件，回退到 `label.mat`。
+5. `*_trigger_info` 文件不参与标签解析。
 
 ---
 

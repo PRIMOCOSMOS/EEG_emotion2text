@@ -88,7 +88,7 @@ def _extract_emotion_from_video_path(video_path: str) -> str:
     return normalize_emotion_name(parts[-2])
 
 
-def load_saveinfo_trial_labels(saveinfo_csv: str, n_trials: int = 80) -> np.ndarray:
+def load_saveinfo_trial_labels(saveinfo_csv: str, n_trials: Optional[int] = 80) -> np.ndarray:
     labels = []
     with open(saveinfo_csv, "r", encoding="utf-8", newline="") as f:
         reader = csv.reader(f)
@@ -97,6 +97,9 @@ def load_saveinfo_trial_labels(saveinfo_csv: str, n_trials: int = 80) -> np.ndar
                 continue
             emotion = _extract_emotion_from_video_path(row[1])
             labels.append(emotion_name_to_label(emotion))
+
+    if n_trials is None:
+        return np.array(labels, dtype=np.int64)
 
     if len(labels) < n_trials:
         raise ValueError(f"Saveinfo 行数不足: {saveinfo_csv}, got={len(labels)}, expected>={n_trials}")
@@ -111,6 +114,7 @@ def find_saveinfo_files(data_root: str, saveinfo_dir: Optional[str] = None) -> L
     files = []
     files.extend(sorted(root.rglob("*_save_info.csv")))
     files.extend(sorted(root.rglob("*save*info*.csv")))
+    files.extend(sorted(root.rglob("*save*info*")))
     files.extend(sorted(root.rglob("*.CSV")))
     seen = set()
     uniq = []
@@ -119,21 +123,39 @@ def find_saveinfo_files(data_root: str, saveinfo_dir: Optional[str] = None) -> L
         if sp in seen:
             continue
         seen.add(sp)
+        name = p.name.lower()
+        if "trigger" in name:
+            continue
+        if "save" not in name or "info" not in name:
+            continue
+        if p.is_dir():
+            continue
         uniq.append(p)
     return uniq
 
 
 def build_subject_label_map_from_saveinfo(data_root: str, saveinfo_dir: Optional[str] = None, n_trials: int = 80):
     saveinfo_files = find_saveinfo_files(data_root, saveinfo_dir)
-    subject_label_map: Dict[int, np.ndarray] = {}
+    grouped: Dict[int, List[Path]] = {}
     for fp in saveinfo_files:
         sid = _extract_subject_id(fp.stem)
         if sid is None:
             continue
-        try:
-            subject_label_map[sid] = load_saveinfo_trial_labels(str(fp), n_trials=n_trials)
-        except Exception:
-            continue
+        grouped.setdefault(sid, []).append(fp)
+
+    subject_label_map: Dict[int, np.ndarray] = {}
+    for sid, files in grouped.items():
+        merged: List[int] = []
+        for fp in sorted(files):
+            try:
+                arr = load_saveinfo_trial_labels(str(fp), n_trials=None)
+            except Exception:
+                continue
+            merged.extend(arr.tolist())
+            if len(merged) >= n_trials:
+                break
+        if len(merged) >= n_trials:
+            subject_label_map[sid] = np.array(merged[:n_trials], dtype=np.int64)
     return subject_label_map
 
 
@@ -177,7 +199,7 @@ def load_two_level_texts_from_csv(text_csv_path: str, n_trials: int = 80):
 
 @dataclass
 class CFG:
-    data_root: str = "/kaggle/input/eeg-emotion2text/EEG_features"
+    data_root: str = "/kaggle/input/datasets/primocosmos/seed-vii-kaggle/EEG_features"
     work_dir: str = "/kaggle/working/eeg2text_ckpt"
 
     # Model
@@ -208,9 +230,9 @@ class CFG:
     save_every_n_steps: int = 100
     max_train_hours: float = 8.8
     time_buffer_minutes: int = 8
-    saveinfo_dir: Optional[str] = "/kaggle/input/eeg-emotion2text/save_info"
+    saveinfo_dir: Optional[str] = "/kaggle/input/datasets/primocosmos/seed-vii-kaggle/save_info"
     text_csv_path: Optional[str] = None
-    l1_l2_text_csv_path: Optional[str] = "/kaggle/input/eeg-emotion2text/Emotion2text/text_protocol_template.csv"
+    l1_l2_text_csv_path: Optional[str] = "/kaggle/input/datasets/primocosmos/seed-vii-kaggle/Emotion2text/text_protocol_template.csv"
 
     # Text encoder
     clip_name: str = "openai/clip-vit-large-patch14"
