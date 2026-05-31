@@ -384,14 +384,11 @@ class EEGTextWindowDataset(Dataset):
         row = self.rows[idx]
         x = torch.tensor(row["eeg"], dtype=torch.float32)
         trial = row["trial"]
-        emotion = EMOTION_NAMES[int(row["label"])]
         return {
             "eeg": x,
             "label": torch.tensor(row["label"], dtype=torch.long),
             "subject": row["subject"],
             "trial": trial,
-            "text_l1": self.l1_texts.get(emotion, DEFAULT_L1_TEXTS[emotion]),
-            "text_l2": self.l2_texts.get(trial, DEFAULT_L2_TEXTS[trial]),
         }
 
 
@@ -401,8 +398,6 @@ def collate_fn(batch: List[Dict]) -> Dict:
         "label": torch.stack([b["label"] for b in batch], dim=0),
         "subject": [b["subject"] for b in batch],
         "trial": [b["trial"] for b in batch],
-        "text_l1": [b["text_l1"] for b in batch],
-        "text_l2": [b["text_l2"] for b in batch],
     }
 
 
@@ -500,6 +495,9 @@ class TextTower(nn.Module):
         self.encoder = CLIPTextModel.from_pretrained(clip_name)
         self.max_len = max_len
         self.cache: Dict[str, torch.Tensor] = {}
+        self.l1_cache_tensor: Optional[torch.Tensor] = None
+        self.l2_cache_tensor: Optional[torch.Tensor] = None
+        self.max_trial_id: int = 80
 
         for p in self.encoder.parameters():
             p.requires_grad = False
@@ -512,6 +510,18 @@ class TextTower(nn.Module):
             nn.LayerNorm(embed_dim),
             nn.Linear(embed_dim, embed_dim),
         )
+
+    @torch.no_grad()
+    def _encode_text_batch(self, texts: List[str], dev: torch.device) -> torch.Tensor:
+        tok = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=self.max_len,
+            return_tensors="pt",
+        )
+        tok = {k: v.to(dev) for k, v in tok.items()}
+        return self.encoder(**tok).pooler_output
 
     @torch.no_grad()
     def _encode_text(self, texts: List[str], dev: torch.device) -> torch.Tensor:
@@ -539,6 +549,40 @@ class TextTower(nn.Module):
             out_feats.append(self.cache[t])
 
         return torch.stack(out_feats, dim=0).to(dev)
+
+    @torch.no_grad()
+    def build_level_caches(self, l1_texts: Dict[str, str], l2_texts: Dict[int, str], dev: torch.device):
+        self.encoder.eval()
+
+        l1_text_list = [l1_texts.get(emo, DEFAULT_L1_TEXTS[emo]) for emo in EMOTION_NAMES]
+        l1_feats = self._encode_text_batch(l1_text_list, dev).detach()
+        self.l1_cache_tensor = l1_feats
+
+        self.max_trial_id = max(max(l2_texts.keys()) if len(l2_texts) > 0 else 80, 80)
+        l2_text_list = [""] + [l2_texts.get(i, DEFAULT_L2_TEXTS.get(i, f"Trial {i}: emotional reaction to the video clip.")) for i in range(1, self.max_trial_id + 1)]
+        l2_feats = self._encode_text_batch(l2_text_list, dev).detach()
+        self.l2_cache_tensor = l2_feats
+
+    def forward_from_ids(
+        self,
+        labels: torch.Tensor,
+        trials: List[int],
+        dev: torch.device,
+        l1_weight: float = 0.4,
+        l2_weight: float = 0.6,
+    ) -> torch.Tensor:
+        if self.l1_cache_tensor is None or self.l2_cache_tensor is None:
+            raise RuntimeError("Text caches are not built. Call build_level_caches(...) before training.")
+
+        lbl = labels.long()
+        trial_ids = torch.as_tensor(trials, dtype=torch.long, device=dev)
+        trial_ids = trial_ids.clamp_min(1).clamp_max(self.max_trial_id)
+
+        f1 = self.l1_cache_tensor.index_select(0, lbl)
+        f2 = self.l2_cache_tensor.index_select(0, trial_ids)
+        fused = l1_weight * f1 + l2_weight * f2
+        z = self.proj(fused)
+        return F.normalize(z, dim=-1)
 
     def forward(self, text_l1: List[str], text_l2: List[str], dev: torch.device, l1_weight: float = 0.4, l2_weight: float = 0.6) -> torch.Tensor:
         f1 = self._encode_text(text_l1, dev)

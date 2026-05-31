@@ -110,9 +110,9 @@ def run_epoch(
         with torch.set_grad_enabled(train_mode):
             with torch.cuda.amp.autocast(enabled=(cfg.amp and device.type == "cuda")):
                 eeg_z = eeg_model(eeg)
-                txt_z = text_model(
-                    batch["text_l1"],
-                    batch["text_l2"],
+                txt_z = text_model.forward_from_ids(
+                    labels,
+                    batch["trial"],
                     device,
                     l1_weight=cfg.l1_weight,
                     l2_weight=cfg.l2_weight,
@@ -202,6 +202,8 @@ def train_one_fold(
     print("[Init] EEG model ready")
     text_model = TextTower(cfg.clip_name, embed_dim=cfg.embed_dim, max_len=cfg.max_text_len).to(device)
     print("[Init] Text model ready")
+    text_model.build_level_caches(l1_texts=l1_texts, l2_texts=l2_texts, dev=device)
+    print(f"[Init] Text caches ready: L1={len(l1_texts)} emotions, L2={len(l2_texts)} trials")
 
     params = list(eeg_model.parameters()) + list(text_model.proj.parameters())
     optimizer = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
