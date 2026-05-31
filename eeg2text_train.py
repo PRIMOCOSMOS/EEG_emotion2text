@@ -11,22 +11,27 @@ from eeg2text_core import (
     EEGEncoder,
     EEGTextWindowDataset,
     TextTower,
-    asymmetric_contrastive_loss,
-    build_trial_texts,
+    asymmetric_soft_contrastive_loss,
+    build_default_l1_texts,
+    build_default_l2_texts,
     collate_fn,
     ensure_work_dir,
     load_all_samples_with_saveinfo,
-    load_trial_texts_from_csv,
+    load_two_level_texts_from_csv,
     seed_everything,
     split_train_val,
 )
 
 
 def build_loaders(
-    train_rows: List[Dict], val_rows: List[Dict], cfg: CFG, trial_texts: Dict[int, Dict[str, str]]
+    train_rows: List[Dict],
+    val_rows: List[Dict],
+    cfg: CFG,
+    l1_texts: Dict[str, str],
+    l2_texts: Dict[int, str],
 ) -> Tuple[DataLoader, DataLoader]:
-    train_ds = EEGTextWindowDataset(train_rows, trial_texts=trial_texts)
-    val_ds = EEGTextWindowDataset(val_rows, trial_texts=trial_texts)
+    train_ds = EEGTextWindowDataset(train_rows, l1_texts=l1_texts, l2_texts=l2_texts)
+    val_ds = EEGTextWindowDataset(val_rows, l1_texts=l1_texts, l2_texts=l2_texts)
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
@@ -93,8 +98,23 @@ def run_epoch(
         with torch.set_grad_enabled(train_mode):
             with torch.cuda.amp.autocast(enabled=(cfg.amp and device.type == "cuda")):
                 eeg_z = eeg_model(eeg)
-                txt_z = text_model(batch["text_l1"], batch["text_l2"], batch["text_l3"], device)
-                loss, metrics = asymmetric_contrastive_loss(eeg_z, txt_z, cfg.temperature, cfg.alpha)
+                txt_z = text_model(
+                    batch["text_l1"],
+                    batch["text_l2"],
+                    device,
+                    l1_weight=cfg.l1_weight,
+                    l2_weight=cfg.l2_weight,
+                )
+                loss, metrics = asymmetric_soft_contrastive_loss(
+                    eeg_z,
+                    txt_z,
+                    cfg.temperature,
+                    cfg.alpha,
+                    batch["label"].to(device),
+                    same_emotion_weight=cfg.same_emotion_weight,
+                    pos_neg_margin=cfg.pos_neg_margin,
+                    margin_loss_weight=cfg.margin_loss_weight,
+                )
 
             if train_mode:
                 optimizer.zero_grad(set_to_none=True)
@@ -135,10 +155,11 @@ def train_one_fold(
     fold_name: str,
     cfg: CFG,
     device: torch.device,
-    trial_texts: Dict[int, Dict[str, str]],
+    l1_texts: Dict[str, str],
+    l2_texts: Dict[int, str],
 ):
     ensure_work_dir(cfg.work_dir)
-    train_loader, val_loader = build_loaders(train_rows, val_rows, cfg, trial_texts=trial_texts)
+    train_loader, val_loader = build_loaders(train_rows, val_rows, cfg, l1_texts=l1_texts, l2_texts=l2_texts)
 
     eeg_model = EEGEncoder(
         f1=cfg.f1,
@@ -289,11 +310,13 @@ def run_loso(cfg: CFG, run_all_folds: bool = False):
     ensure_work_dir(cfg.work_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if cfg.text_csv_path and os.path.exists(cfg.text_csv_path):
-        trial_texts = load_trial_texts_from_csv(cfg.text_csv_path, n_trials=80)
-        print("loaded text protocol csv:", cfg.text_csv_path)
+    text_csv_path = cfg.l1_l2_text_csv_path or cfg.text_csv_path
+    if text_csv_path and os.path.exists(text_csv_path):
+        l1_texts, l2_texts = load_two_level_texts_from_csv(text_csv_path, n_trials=80)
+        print("loaded two-level text protocol csv:", text_csv_path)
     else:
-        trial_texts = build_trial_texts(80)
+        l1_texts = build_default_l1_texts()
+        l2_texts = build_default_l2_texts(80)
         print("text protocol csv not found, fallback to template text.")
 
     all_rows = load_all_samples_with_saveinfo(cfg.data_root, saveinfo_dir=cfg.saveinfo_dir)
@@ -314,7 +337,7 @@ def run_loso(cfg: CFG, run_all_folds: bool = False):
         print("\n===", fold_name, "===")
         print("train/val/test =", len(train_rows), len(val_rows), len(test_rows))
 
-        fold_result = train_one_fold(train_rows, val_rows, fold_name, cfg, device, trial_texts)
+        fold_result = train_one_fold(train_rows, val_rows, fold_name, cfg, device, l1_texts, l2_texts)
         fold_results.append(fold_result)
 
     result_path = os.path.join(cfg.work_dir, "loso_results.json")

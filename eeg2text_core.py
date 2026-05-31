@@ -35,20 +35,17 @@ def seed_everything(seed: int = 42) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def build_trial_texts(n_trials: int = 80) -> Dict[int, Dict[str, str]]:
-    corpus = {}
-    for trial_idx in range(1, n_trials + 1):
-        corpus[trial_idx] = {
-            "level2": f"Trial {trial_idx}: emotional reaction to a movie clip segment.",
-            "level3": (
-                f"Trial {trial_idx} captures a full temporal emotional narrative from exposure, "
-                "reaction onset, and sustained affective state over the viewing period."
-            ),
-        }
-    return corpus
+def build_default_l1_texts() -> Dict[str, str]:
+    # Window-level text; user can set all emotions to the same text if needed.
+    return {emo: L1_PROTOTYPE[emo] for emo in EMOTION_NAMES}
 
 
-TRIAL_TEXTS = build_trial_texts(80)
+def build_default_l2_texts(n_trials: int = 80) -> Dict[int, str]:
+    return {trial_idx: f"Trial {trial_idx}: emotional reaction to the video clip." for trial_idx in range(1, n_trials + 1)}
+
+
+DEFAULT_L1_TEXTS = build_default_l1_texts()
+DEFAULT_L2_TEXTS = build_default_l2_texts(80)
 
 EMOTION_ALIASES = {
     "neutral": "neutral",
@@ -128,32 +125,36 @@ def build_subject_label_map_from_saveinfo(data_root: str, saveinfo_dir: Optional
     return subject_label_map
 
 
-def load_trial_texts_from_csv(text_csv_path: str, n_trials: int = 80) -> Dict[int, Dict[str, str]]:
-    # 协议: 至少包含 trial 列，可选 emotion,l1_text,l2_text,l3_text
-    # 若缺失文本列，使用默认模板自动补齐。
-    trial_texts = build_trial_texts(n_trials)
+def load_two_level_texts_from_csv(text_csv_path: str, n_trials: int = 80):
+    # 协议(单文件):
+    # 必备列: emotion,l1_text,trial,l2_text
+    # L1: emotion + l1_text
+    # L2: trial + l2_text (trial=1..80)
+    # 若缺失字段，自动回退默认文本。
+    l1_texts = build_default_l1_texts()
+    l2_texts = build_default_l2_texts(n_trials)
+
     with open(text_csv_path, "r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            if "trial" not in row:
-                continue
-            try:
-                trial = int(row["trial"])
-            except Exception:
-                continue
-            if trial < 1 or trial > n_trials:
-                continue
+            emo_raw = (row.get("emotion", "") or "").strip().lower()
+            l1_raw = (row.get("l1_text", "") or "").strip()
+            if l1_raw:
+                if emo_raw:
+                    emo = normalize_emotion_name(emo_raw)
+                    l1_texts[emo] = l1_raw
 
-            emotion = normalize_emotion_name(row.get("emotion", "neutral"))
-            l1 = row.get("l1_text", "").strip() or L1_PROTOTYPE[emotion]
-            l2 = row.get("l2_text", "").strip() or trial_texts[trial]["level2"]
-            l3 = row.get("l3_text", "").strip() or trial_texts[trial]["level3"]
-            trial_texts[trial] = {"level2": l2, "level3": l3, "level1": l1}
+            trial_raw = (row.get("trial", "") or "").strip()
+            l2_raw = (row.get("l2_text", "") or "").strip()
+            if trial_raw and l2_raw:
+                try:
+                    trial = int(trial_raw)
+                except Exception:
+                    trial = -1
+                if 1 <= trial <= n_trials:
+                    l2_texts[trial] = l2_raw
 
-    for t in range(1, n_trials + 1):
-        if "level1" not in trial_texts[t]:
-            trial_texts[t]["level1"] = L1_PROTOTYPE["neutral"]
-    return trial_texts
+    return l1_texts, l2_texts
 
 
 @dataclass
@@ -191,10 +192,16 @@ class CFG:
     time_buffer_minutes: int = 8
     saveinfo_dir: Optional[str] = None
     text_csv_path: Optional[str] = None
+    l1_l2_text_csv_path: Optional[str] = None
 
     # Text encoder
     clip_name: str = "openai/clip-vit-large-patch14"
     max_text_len: int = 64
+    l1_weight: float = 0.4
+    l2_weight: float = 0.6
+    same_emotion_weight: float = 1.0
+    pos_neg_margin: float = 0.20
+    margin_loss_weight: float = 0.20
 
 
 def find_subject_files(data_root: str) -> List[Path]:
@@ -280,9 +287,15 @@ def load_all_samples_with_saveinfo(data_root: str, saveinfo_dir: Optional[str] =
 
 
 class EEGTextWindowDataset(Dataset):
-    def __init__(self, rows: List[Dict], trial_texts: Optional[Dict[int, Dict[str, str]]] = None):
+    def __init__(
+        self,
+        rows: List[Dict],
+        l1_texts: Optional[Dict[str, str]] = None,
+        l2_texts: Optional[Dict[int, str]] = None,
+    ):
         self.rows = rows
-        self.trial_texts = trial_texts if trial_texts is not None else TRIAL_TEXTS
+        self.l1_texts = l1_texts if l1_texts is not None else DEFAULT_L1_TEXTS
+        self.l2_texts = l2_texts if l2_texts is not None else DEFAULT_L2_TEXTS
 
     def __len__(self):
         return len(self.rows)
@@ -292,15 +305,13 @@ class EEGTextWindowDataset(Dataset):
         x = torch.tensor(row["eeg"], dtype=torch.float32)
         trial = row["trial"]
         emotion = EMOTION_NAMES[int(row["label"])]
-        ttxt = self.trial_texts.get(trial, {})
         return {
             "eeg": x,
             "label": torch.tensor(row["label"], dtype=torch.long),
             "subject": row["subject"],
             "trial": trial,
-            "text_l1": ttxt.get("level1", L1_PROTOTYPE[emotion]),
-            "text_l2": ttxt.get("level2", TRIAL_TEXTS[trial]["level2"]),
-            "text_l3": ttxt.get("level3", TRIAL_TEXTS[trial]["level3"]),
+            "text_l1": self.l1_texts.get(emotion, DEFAULT_L1_TEXTS[emotion]),
+            "text_l2": self.l2_texts.get(trial, DEFAULT_L2_TEXTS[trial]),
         }
 
 
@@ -312,7 +323,6 @@ def collate_fn(batch: List[Dict]) -> Dict:
         "trial": [b["trial"] for b in batch],
         "text_l1": [b["text_l1"] for b in batch],
         "text_l2": [b["text_l2"] for b in batch],
-        "text_l3": [b["text_l3"] for b in batch],
     }
 
 
@@ -450,25 +460,110 @@ class TextTower(nn.Module):
 
         return torch.stack(out_feats, dim=0).to(dev)
 
-    def forward(self, text_l1: List[str], text_l2: List[str], text_l3: List[str], dev: torch.device) -> torch.Tensor:
+    def forward(self, text_l1: List[str], text_l2: List[str], dev: torch.device, l1_weight: float = 0.4, l2_weight: float = 0.6) -> torch.Tensor:
         f1 = self._encode_text(text_l1, dev)
         f2 = self._encode_text(text_l2, dev)
-        f3 = self._encode_text(text_l3, dev)
-        fused = 0.5 * f1 + 0.3 * f2 + 0.2 * f3
+        fused = l1_weight * f1 + l2_weight * f2
         z = self.proj(fused)
         return F.normalize(z, dim=-1)
 
 
 def asymmetric_contrastive_loss(eeg_z: torch.Tensor, txt_z: torch.Tensor, temperature: float, alpha: float):
+    raise RuntimeError("Use asymmetric_soft_contrastive_loss with metadata.")
+
+
+def build_similarity_targets(
+    labels: torch.Tensor,
+    device: torch.device,
+    same_emotion_weight: float = 1.0,
+) -> torch.Tensor:
+    # Updated rule:
+    # same emotion -> positive
+    # different emotion -> negative
+    bsz = int(labels.shape[0])
+    sim = torch.zeros((bsz, bsz), dtype=torch.float32, device=device)
+
+    for i in range(bsz):
+        for j in range(bsz):
+            same_emotion = int(labels[i].item()) == int(labels[j].item())
+
+            if same_emotion:
+                sim[i, j] = same_emotion_weight
+            else:
+                sim[i, j] = 0.0
+
+    # Row-wise normalization to valid probability distribution.
+    row_sum = sim.sum(dim=1, keepdim=True)
+    zero_mask = row_sum.squeeze(1) <= 0
+    if zero_mask.any():
+        zero_idx = torch.where(zero_mask)[0]
+        sim[zero_idx, zero_idx] = 1.0
+        row_sum = sim.sum(dim=1, keepdim=True)
+
+    target = sim / row_sum.clamp_min(1e-12)
+    return target
+
+
+def soft_cross_entropy(logits: torch.Tensor, soft_targets: torch.Tensor) -> torch.Tensor:
+    log_prob = F.log_softmax(logits, dim=1)
+    return -(soft_targets * log_prob).sum(dim=1).mean()
+
+
+def asymmetric_soft_contrastive_loss(
+    eeg_z: torch.Tensor,
+    txt_z: torch.Tensor,
+    temperature: float,
+    alpha: float,
+    labels: torch.Tensor,
+    same_emotion_weight: float = 1.0,
+    pos_neg_margin: float = 0.20,
+    margin_loss_weight: float = 0.20,
+):
     logits = (eeg_z @ txt_z.t()) / temperature
-    target = torch.arange(logits.size(0), device=logits.device)
-    loss_e2t = F.cross_entropy(logits, target)
-    loss_t2e = F.cross_entropy(logits.t(), target)
-    loss = alpha * loss_e2t + (1.0 - alpha) * loss_t2e
+
+    target_e2t = build_similarity_targets(
+        labels,
+        logits.device,
+        same_emotion_weight=same_emotion_weight,
+    )
+    target_t2e = target_e2t.t()
+    target_t2e = target_t2e / target_t2e.sum(dim=1, keepdim=True).clamp_min(1e-12)
+
+    loss_e2t = soft_cross_entropy(logits, target_e2t)
+    loss_t2e = soft_cross_entropy(logits.t(), target_t2e)
+
+    # Margin term: same-emotion pairs should be closer than different-emotion pairs.
+    sim = eeg_z @ txt_z.t()
+    bsz = sim.size(0)
+    margin_terms = []
+    for i in range(bsz):
+        label_i = int(labels[i].item())
+        pos_mask = torch.tensor(
+            [int(labels[j].item()) == label_i for j in range(bsz)],
+            dtype=torch.bool,
+            device=sim.device,
+        )
+        neg_mask = torch.tensor(
+            [int(labels[j].item()) != label_i for j in range(bsz)],
+            dtype=torch.bool,
+            device=sim.device,
+        )
+
+        s_pos = sim[i][pos_mask].mean() if pos_mask.any() else sim[i, i]
+        s_neg = sim[i][neg_mask].mean() if neg_mask.any() else (s_pos - 1.0)
+
+        margin_terms.append(F.relu(pos_neg_margin - (s_pos - s_neg)))
+
+    margin_loss = torch.stack(margin_terms).mean() if len(margin_terms) > 0 else torch.tensor(0.0, device=sim.device)
+
+    base_loss = alpha * loss_e2t + (1.0 - alpha) * loss_t2e
+    loss = base_loss + margin_loss_weight * margin_loss
 
     with torch.no_grad():
+        # Keep a simple retrieval metric for monitoring.
+        hard_target = torch.arange(logits.size(0), device=logits.device)
         pred = logits.argmax(dim=1)
-        acc = (pred == target).float().mean().item()
+        acc = (pred == hard_target).float().mean().item()
     return loss, {"batch_retrieval_acc": acc}
 
 
