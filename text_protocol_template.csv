@@ -1,11 +1,88 @@
 emotion,l1_text,trial,l2_text
-neutral,This EEG window reflects neutral affective evidence.,,
-joy,This EEG window reflects joyful affective evidence.,,
-sadness,This EEG window reflects sad affective evidence.,,
-fear,This EEG window reflects fearful affective evidence.,,
-disgust,This EEG window reflects disgust-related affective evidence.,,
-anger,This EEG window reflects angry affective evidence.,,
-surprise,This EEG window reflects surprised affective evidence.,,
-,,1,Trial 1 video description.
-,,2,Trial 2 video description.
-,,3,Trial 3 video description.
+neutral,"This EEG window reflects neutral affective evidence.",,
+joy,"This EEG window reflects joyful affective evidence.",,
+sadness,"This EEG window reflects sad affective evidence.",,
+fear,"This EEG window reflects fearful affective evidence.",,
+disgust,"This EEG window reflects disgust-related affective evidence.",,
+anger,"This EEG window reflects angry affective evidence.",,
+surprise,"This EEG window reflects surprised affective evidence.",,
+,,1,"The hilarious slapstick chaos of a thief reluctantly bonding with a baby leads to a peak of joyful and lighthearted laughter."
+,,2,"Quiet views of traditional gardens and tranquil canals create a state of peaceful and emotionally neutral observation."
+,,3,"The sight of a person consuming a live and slimy creature triggers an immediate and intense visceral reaction of revulsion."
+,,4,"A mother's agonizing decision to save only one child during a disaster leads to a heart-wrenching emotional low of sorrow."
+,,5,"A scene portraying a mother's verbal and physical abuse toward her young daughter sparks a strong sense of moral outrage and anger."
+,,6,"Witnessing the intentional and cruel mistreatment of a dog provokes a sharp feeling of fury and indignation at the injustice."
+,,7,"A poignant moment capturing the pure and innocent sorrow of a couple facing terminal illness and unavoidable loss."
+,,8,"Graphic gore and over-the-top splatter from a horror comedy create an overwhelming and chaotic sense of visceral disgust."
+,,9,"An instructional video demonstrating how to repair a computer IDE interface provides purely technical and emotionally neutral information."
+,,10,"A high school boy experiences the pure and innocent happiness of a first crush, creating a lighthearted and joyful atmosphere."
+,,11,"A couple shares warm and intimate memories before a tragic accident, capturing a nostalgic and joyful mood."
+,,12,"Static shots of historical landscapes and traditional architecture offer a state of calm and objective visual appreciation."
+,,13,"The host of a survival show consumes raw and unappealing internal organs in the wild, eliciting a strong feeling of disgust."
+,,14,"A terminally ill father attempts to secure a future for his adopted children, creating a deeply sympathetic and sorrowful tone."
+,,15,"Footage of a person violently abusing a pet induces a sudden and intense feeling of righteous anger and helplessness."
+,,16,"Violent clashes and social unrest during a street protest evoke a sense of frustration and aggressive anger."
+,,17,"A poignant reunion between a mother and her son after years of separation highlights the bittersweet joy and deep sorrow of lost time."
+,,18,"A close-up view of a hand covered in disturbing skin lesions triggers an instinctive and powerful feeling of physical revulsion."
+,,19,"Panoramic views of granite peaks and twisted pines offer a peaceful experience with no significant emotional arousal."
+,,20,"A scientist receives high-level national recognition for his contributions, evoking a profound sense of joyful pride and triumph."
+,,21,"Older students brutally bully a classmate in a hallway, inducing a powerful sense of moral outrage and social fury."
+,,22,"A mother's agonizing breakdown in the aftermath of a disaster captures a peak of deep and heavy sadness."
+,,23,"A performer becomes possessed by a malevolent spirit during a ritual, creating a state of high-intensity dread and fear."
+,,24,"Steady footage of a world heritage site provides a tranquil and emotionally balanced visual experience."
+,,25,"A magician performs a complex card trick that defies logic, leaving the viewer in a state of stunned amazement and surprise."
+,,26,"An illusionist produces an endless stream of objects from thin air, evoking a sense of wonder and sudden surprise."
+,,27,"A neutral presentation of natural wonders offers a peaceful experience with no emotional fluctuation."
+,,28,"A group of friends trapped in a haunted hotel encounter supernatural entities, building a persistent and growing feeling of fear."
+,,29,"The main character in Little Daddy mourns the sudden and tragic loss of his best friend, resulting in a deeply sorrowful state."
+,,30,"A domestic dispute escalates into a violent outburst of rage as objects are smashed, triggering a surge of anger."
+,,31,"A bride is humiliated and physically mistreated by her in-laws on her wedding day, provoking a strong emotional reaction of indignation."
+,,32,"A boy with cerebral palsy faces cruel rejection and exclusion from his peers, evoking a heavy sense of sympathy and sadness."
+,,33,"A woman is possessed by a vengeful spirit after using a divination board, inducing a state of sharp terror and fear."
+,,34,"A neutral instructional segment on the operation of a multimedia projector provides purely functional and dry information."
+,,35,"Coins disappear and reappear in a complex magic display that creates a sense of delightful surprise."
+,,36,"A street magician performs an unbelievable levitation trick in public, causing an immediate reaction of awe and surprise."
+,,37,"A technical guide explaining how to resolve computer hardware conflicts remains entirely objective and emotionally neutral."
+,,38,"Ghostly whispers and demonic transformations in a dark theater area create a chilling and intensely fearful atmosphere."
+,,39,"A father's desperate search for his missing child in Dearest highlights a state of profound agony and sorrow."
+,,40,"Footage of graphic cruelty toward a defenseless dog causes an immediate and intense feeling of anger and moral disgust."
+,,41,"Chaotic and funny mishaps involving an infant lead to a lighthearted and infectious joyful experience."
+,,42,"An incredibly skilled card illusion performed for judges leaves observers in a state of total disbelief and surprise."
+,,43,"Scientific footage of a sea creature expelling its internal organs triggers a slow and nauseating feeling of visceral disgust."
+,,44,"A woman sees a ghostly child in a hotel, causing the protagonist to scream in a state of sudden and paralyzing fear."
+,,45,"A scene depicting family violence and domestic physical assault induces a strong feeling of rage and helplessness."
+,,46,"Public verbal abuse and humiliation of a character by her superior evoke a sharp sense of resentment and indignant anger."
+,,47,"A lone actress is stalked by unseen entities in a haunted opera house, building a state of eerie dread and fear."
+,,48,"A DIY tutorial showing how to simulate severe skin burns and blisters creates a visceral and uncomfortable feeling of revulsion."
+,,49,"A magician makes a full-sized bicycle appear out of thin air, causing the audience to gasp in astonishment and surprise."
+,,50,"A couple overcomes their crisis and shares a warm embrace in Meet Miss Anxiety, bringing a sense of relief and quiet joy."
+,,51,"A couple in You Are My Life finally reconciles after years of conflict, their tears of joy highlighting a happy reunion."
+,,52,"A magician performs a ribbon transformation trick that breaks physical laws, inducing a state of sudden surprise."
+,,53,"The host of a survival show consumes raw insect larvae with gooey insides, triggering a strong and unpleasant gag reflex."
+,,54,"A woman sees a ghostly figure in her rearview mirror while driving alone at night, causing a peak of sharp fear."
+,,55,"A group of teenagers violently kicks a defenseless classmate, inducing a profound sense of moral outrage and fury."
+,,56,"A brutal attack on a woman in a restaurant setting sparks an intense feeling of anger and social indignation."
+,,57,"Teenagers summoning a spirit that appears as a gruesome corpse in their room creates a climax of pure and intense terror."
+,,58,"Graphic gore and blood splatter during a chaotic zombie encounter trigger a state of intense visceral disgust."
+,,59,"A masterfully executed coin transformation routine leaves the audience speechless and in a state of stunned surprise."
+,,60,"A family sharing a meal with laughter and genuine warmth in Home Sweet Home creates a stable and joyful emotional tone."
+,,61,"A predator slowly devours its prey in a raw nature scene, inducing a lingering sense of biological disgust."
+,,62,"Parents share their collective grief over their missing children in a support group, creating an atmosphere of persistent sadness."
+,,63,"A possessed actor walks on burning coals with a demonic expression, inducing a state of high-arousal fear."
+,,64,"A signed card magically appears inside a sealed lemon during a high-stakes performance, leaving hosts in a state of surprise."
+,,65,"A teenage boy's pure happiness as he walks silently beside his crush in the snow creates a gentle and joyful mood."
+,,66,"Two young people find a deep connection through sign language, leading to a moment of pure and joyful revelation."
+,,67,"A coin vanishing and reappearing from inside a volunteer's closed fist causes a sense of bewilderment and surprise."
+,,68,"A possessed doll attacks a terrified couple in their home, inducing a peak of intense and high-arousal fear."
+,,69,"A dying father says a final, heartbreaking goodbye to his children, evoking a state of profound and deep sadness."
+,,70,"Graphic and slow violence involving a woman being disemboweled by a robot triggers an overwhelming feeling of disgust."
+,,71,"The sight and sound of a woman vomiting uncontrollably evoke an immediate and intense visceral reaction of revulsion."
+,,72,"A university couple breaks up at a train station in So Young, capturing the heavy and poignant sorrow of lost love."
+,,73,"A hotel room transforms into a surreal and frozen hellscape in 1408, inducing a state of escalating dread and fear."
+,,74,"Complex coin manipulations that defy visual tracking leave the audience in a state of total amazement and surprise."
+,,75,"A couple rides a bicycle together on a sunny day in Under the Hawthorn Tree, evoking a sense of pure and innocent joy."
+,,76,"A 70-year-old woman transformed into her younger self dances happily on stage, leading to a joyful and energetic state."
+,,77,"Coins passing through a solid glass table create a visual paradox that leaves the viewer in a state of absolute surprise."
+,,78,"A psychiatrist is haunted by the ghost of a patient in her own home, building a persistent and chilling feeling of fear."
+,,79,"A character collapses upon receiving devastating news of a loved one's death, inducing a sharp and heavy state of grief."
+,,80,"Repeated scenes of physical illness and vomiting trigger a continuous and strong feeling of visceral disgust."
