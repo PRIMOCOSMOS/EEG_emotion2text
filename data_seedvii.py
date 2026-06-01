@@ -328,6 +328,96 @@ def build_subject_label_map_from_saveinfo(data_root, saveinfo_dir=None, n_trials
     return subject_label_map
 
 
+# --------------------------------------------------------------------------- #
+# Robust .mat reading (v7 via scipy, v7.3 via h5py) + feature normalization.
+# --------------------------------------------------------------------------- #
+def _load_mat_any(path) -> Dict[str, np.ndarray]:
+    """Load a .mat as {key: ndarray}, supporting BOTH classic (<=v7) and
+    HDF5-based v7.3 files.
+
+    scipy.io.loadmat cannot read MATLAB v7.3 (HDF5) files and raises
+    NotImplementedError; SEED-VII subject files can be large and are sometimes
+    saved as v7.3. We transparently fall back to h5py in that case. h5py stores
+    arrays transposed vs MATLAB, so we transpose back to MATLAB column order.
+    """
+    path = str(path)
+    try:
+        m = sio.loadmat(path)  # classic v5/v6/v7
+        return {k: v for k, v in m.items() if not k.startswith("__")}
+    except NotImplementedError:
+        pass  # -> v7.3, use h5py
+    except Exception as e:
+        raise RuntimeError(f"Failed to read .mat (classic reader): {path}: {e}") from e
+
+    try:
+        import h5py
+    except Exception as e:  # pragma: no cover - environment dependent
+        raise RuntimeError(
+            f"{path} appears to be a MATLAB v7.3 (HDF5) file but h5py is not "
+            f"installed. Run `pip install h5py` (preinstalled on Kaggle)."
+        ) from e
+
+    out: Dict[str, np.ndarray] = {}
+    with h5py.File(path, "r") as f:
+        for k in f.keys():
+            if k.startswith("#"):
+                continue
+            try:
+                arr = np.array(f[k])
+            except Exception:
+                continue
+            # h5py returns data transposed relative to MATLAB; undo it.
+            if arr.ndim >= 2:
+                arr = np.transpose(arr, axes=tuple(reversed(range(arr.ndim))))
+            out[k] = arr
+    return out
+
+
+def _mat_get(mat: Dict[str, np.ndarray], key: str):
+    """Case-insensitive, whitespace-tolerant key lookup into a loaded .mat dict."""
+    if key in mat:
+        return mat[key]
+    low = key.lower()
+    for k, v in mat.items():
+        if k.lower() == low:
+            return v
+    return None
+
+
+def _normalize_feat_TBN(arr: np.ndarray, n_bands: int = 5, n_chan: int = 62) -> Optional[np.ndarray]:
+    """Coerce a per-trial feature array to canonical shape (T, n_bands, n_chan).
+
+    Handles: leading/trailing singleton dims, and (5,62,T)/(T,62,5)/(62,5,T)
+    axis permutations by locating the band(=5) and channel(=62) axes. Returns
+    float32 with NaN/Inf replaced by 0; returns None if it can't be coerced.
+    """
+    arr = np.asarray(arr, dtype=np.float32)
+    arr = np.squeeze(arr)
+    if arr.ndim == 2:
+        # (5,62) single window -> (1,5,62); or (62,5) -> transpose
+        if arr.shape == (n_bands, n_chan):
+            arr = arr[np.newaxis, ...]
+        elif arr.shape == (n_chan, n_bands):
+            arr = arr.T[np.newaxis, ...]
+        else:
+            return None
+    if arr.ndim != 3:
+        return None
+
+    # Identify which axes correspond to bands(5) and channels(62).
+    shape = arr.shape
+    band_axis = next((i for i, s in enumerate(shape) if s == n_bands), None)
+    chan_axis = next((i for i, s in enumerate(shape) if s == n_chan and i != band_axis), None)
+    if band_axis is None or chan_axis is None:
+        return None
+    time_axis = ({0, 1, 2} - {band_axis, chan_axis}).pop()
+    arr = np.transpose(arr, (time_axis, band_axis, chan_axis))  # (T, 5, 62)
+
+    if not np.isfinite(arr).all():
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.ascontiguousarray(arr, dtype=np.float32)
+
+
 def find_subject_files(data_root: str) -> List[Path]:
     root = Path(_normalize_kaggle_input_path(data_root))
     mats = sorted(root.rglob("*.mat"))
@@ -415,35 +505,59 @@ def _band_vector_to_2d(data_1d: np.ndarray, size: Tuple[int, int]) -> np.ndarray
     return img
 
 
-def de_window_to_4d(de_window: np.ndarray, image_frames: int, image_channels: int,
-                    image_height: int, image_width: int) -> np.ndarray:
-    """Convert one DE window (5, 62) -> 4D tensor (frames, channels, H, W).
+def feat_window_to_4d(de_window: np.ndarray, image_frames: int, image_channels: int,
+                      image_height: int, image_width: int,
+                      psd_window: "np.ndarray | None" = None,
+                      use_psd: bool = True) -> np.ndarray:
+    """Convert one window's DE (and PSD) features -> 4D tensor (frames, C, H, W).
 
-    SEED-VII provides only DE over 5 bands (no PSD, no intra-window frames).
-    To match SST-LegoViT's (frames, bands, H, W) expectation:
-      * The 5 DE bands are each turned into a 9x9 -> (H,W) topographic map.
-      * To fill `image_channels` (default 10 = 5 DE + 5 "PSD" slots in the
-        reference), we duplicate the DE band maps; this keeps the dual-stream
-        Legoformer (DE/PSD) structurally valid. See MIGRATION.md.
-      * The single 4s window is replicated across `image_frames` temporal
-        frames so the temporal transformer receives a valid sequence.
-    de_window: shape (5, 62)
+    SEED-VII provides BOTH DE and PSD per window, each shaped (5, 62) (5 freq
+    bands x 62 electrodes). To match the official EmotionCLIP "DE_PSD" input
+    (image_channels=10) we build the spectral/channel axis as:
+
+        [ DE_band0..DE_band4 , PSD_band0..PSD_band4 ]   (DE first, PSD second)
+
+    This ordering is intentional: the Legoformer dual-stream splits the channel
+    axis in half (`x[:, :C//2]` = DE stream, `x[:, C//2:]` = PSD stream), so the
+    first half MUST be DE and the second half PSD -- exactly the official
+    "DE first, PSD second" layout (their indices=[0,2,4,6,8, 1,3,5,7,9]).
+
+    Each (62,) band vector is mapped to a 9x9 scalp topographic grid and
+    bicubic-resized to (H, W).
+
+    Fallbacks:
+      * If `psd_window` is None or `use_psd=False`, the DE maps are duplicated to
+        fill the requested channels (legacy behaviour; logged once upstream).
+      * The single window is replicated across `image_frames` temporal frames
+        (SEED-VII DE/PSD are window-level aggregates without intra-window frames).
+    de_window / psd_window: shape (5, 62)
     """
-    bands = de_window.shape[0]  # 5 for SEED-VII
     size = (image_width, image_height)
-    band_imgs = np.stack([_band_vector_to_2d(de_window[b], size) for b in range(bands)], axis=0)  # (5,H,W)
+    de_maps = np.stack([_band_vector_to_2d(de_window[b], size)
+                        for b in range(de_window.shape[0])], axis=0)   # (5,H,W)
 
-    # Build the channel (spectral) axis up to image_channels.
-    if image_channels <= bands:
-        chan = band_imgs[:image_channels]
+    if use_psd and psd_window is not None:
+        psd_maps = np.stack([_band_vector_to_2d(psd_window[b], size)
+                             for b in range(psd_window.shape[0])], axis=0)  # (5,H,W)
+        chan = np.concatenate([de_maps, psd_maps], axis=0)            # (10,H,W) DE|PSD
     else:
-        reps = int(np.ceil(image_channels / bands))
-        chan = np.concatenate([band_imgs] * reps, axis=0)[:image_channels]  # (C,H,W)
+        chan = de_maps                                                # (5,H,W)
 
-    # Replicate the window across frames.
-    frame = chan[np.newaxis, ...]                       # (1,C,H,W)
-    frames = np.repeat(frame, image_frames, axis=0)     # (frames,C,H,W)
+    # Fit to requested image_channels (truncate or tile to be safe).
+    if chan.shape[0] >= image_channels:
+        chan = chan[:image_channels]
+    else:
+        reps = int(np.ceil(image_channels / chan.shape[0]))
+        chan = np.concatenate([chan] * reps, axis=0)[:image_channels]
+
+    frames = np.repeat(chan[np.newaxis, ...], image_frames, axis=0)   # (frames,C,H,W)
     return frames.astype(np.float32)
+
+
+# Backward-compatible alias (DE-only) kept for any external callers.
+def de_window_to_4d(de_window, image_frames, image_channels, image_height, image_width):
+    return feat_window_to_4d(de_window, image_frames, image_channels,
+                             image_height, image_width, psd_window=None, use_psd=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -451,41 +565,80 @@ def de_window_to_4d(de_window: np.ndarray, image_frames: int, image_channels: in
 # --------------------------------------------------------------------------- #
 def load_subject_windows(subject_file: Path, trial_labels: np.ndarray,
                          normalize_subject_zscore: bool = True,
-                         label_scheme: Optional["LabelScheme"] = None) -> List[Dict]:
-    mat = sio.loadmat(subject_file)
-    trial_data = []
+                         label_scheme: Optional["LabelScheme"] = None,
+                         de_key: str = "de", use_psd: bool = True) -> List[Dict]:
+    """Load per-window DE (and PSD) features for one subject .mat.
+
+    SEED-VII .mat files contain, per trial i (1..80):
+        de_i      (T,5,62)  raw differential entropy
+        de_LDS_i  (T,5,62)  LDS-smoothed DE
+        psd_i     (T,5,62)  power spectral density
+    de_key selects "de_LDS" (LDS-smoothed, recommended) or "de" (raw). use_psd
+    loads psd_i too. Robust to MATLAB v7.3 files, axis permutations, singleton
+    dims, case differences, and NaN/Inf. DE and PSD are z-scored INDEPENDENTLY
+    (per subject) before being stacked into the DE/PSD dual-stream channel axis.
+    """
+    mat = _load_mat_any(subject_file)
+    have_psd = use_psd and any(_mat_get(mat, f"psd_{i}") is not None
+                               for i in range(1, len(trial_labels) + 1))
+
+    trial_data = []  # (trial_idx, de(T,5,62), psd or None, label)
     for trial_idx in range(1, len(trial_labels) + 1):
-        key = f"de_{trial_idx}"
-        if key not in mat:
+        raw = _mat_get(mat, f"{de_key}_{trial_idx}")
+        if raw is None:                          # fall back to raw de_ if de_LDS_ missing
+            raw = _mat_get(mat, f"de_{trial_idx}")
+        if raw is None:
             continue
-        arr = np.asarray(mat[key], dtype=np.float32)  # (T,5,62)
-        if arr.ndim != 3:
+        de = _normalize_feat_TBN(raw)            # -> (T,5,62) float32, NaN-safe
+        if de is None or de.shape[0] == 0:
             continue
+        psd = None
+        if have_psd:
+            praw = _mat_get(mat, f"psd_{trial_idx}")
+            if praw is not None:
+                psd = _normalize_feat_TBN(praw)
+                if psd is not None and psd.shape[0] != de.shape[0]:
+                    # window-count mismatch -> crop both to the shorter (safe)
+                    T = min(psd.shape[0], de.shape[0])
+                    de, psd = de[:T], psd[:T]
         fine = int(max(0, min(int(trial_labels[trial_idx - 1]), len(EMOTION_NAMES) - 1)))
         label = label_scheme.map_fine(fine) if label_scheme is not None else fine
-        trial_data.append((trial_idx, arr, label))
+        trial_data.append((trial_idx, de, psd, label))
 
+    # Per-subject z-score, DE and PSD normalized separately.
     if normalize_subject_zscore and trial_data:
-        all_win = np.concatenate([x[1] for x in trial_data], axis=0)  # (N,5,62)
-        mu = all_win.mean(axis=0, keepdims=True)
-        sigma = np.clip(all_win.std(axis=0, keepdims=True), 1e-6, None)
-        trial_data = [(ti, (arr - mu) / sigma, lb) for ti, arr, lb in trial_data]
+        all_de = np.concatenate([x[1] for x in trial_data], axis=0)       # (N,5,62)
+        de_mu = all_de.mean(axis=0, keepdims=True)
+        de_sd = np.clip(all_de.std(axis=0, keepdims=True), 1e-6, None)
+        psd_list = [x[2] for x in trial_data if x[2] is not None]
+        if psd_list:
+            all_psd = np.concatenate(psd_list, axis=0)
+            psd_mu = all_psd.mean(axis=0, keepdims=True)
+            psd_sd = np.clip(all_psd.std(axis=0, keepdims=True), 1e-6, None)
+        normed = []
+        for ti, de, psd, lb in trial_data:
+            de_n = (de - de_mu) / de_sd
+            psd_n = ((psd - psd_mu) / psd_sd) if (psd is not None) else None
+            normed.append((ti, de_n, psd_n, lb))
+        trial_data = normed
 
     samples = []
-    for trial_idx, arr, label in trial_data:
-        for t in range(arr.shape[0]):
+    for trial_idx, de, psd, label in trial_data:
+        for t in range(de.shape[0]):
             samples.append({
                 "subject": subject_file.stem,
                 "trial": trial_idx,
                 "label": label,
-                "de": arr[t],  # (5,62)
+                "de": de[t],                              # (5,62)
+                "psd": psd[t] if psd is not None else None,  # (5,62) or None
             })
     return samples
 
 
 def load_all_samples_with_saveinfo(data_root, saveinfo_dir=None, n_trials=80,
                                    normalize_subject_zscore=True,
-                                   label_scheme: Optional["LabelScheme"] = None) -> List[Dict]:
+                                   label_scheme: Optional["LabelScheme"] = None,
+                                   de_key: str = "de", use_psd: bool = True) -> List[Dict]:
     data_root = _normalize_kaggle_input_path(data_root)
     if saveinfo_dir:
         saveinfo_dir = _normalize_kaggle_input_path(saveinfo_dir)
@@ -500,9 +653,11 @@ def load_all_samples_with_saveinfo(data_root, saveinfo_dir=None, n_trials=80,
     print(f"saveinfo subjects parsed: {len(subject_label_map)}")
     if label_scheme is not None:
         print(f"label scheme: {label_scheme.describe()}")
+    print(f"feature config: de_key='{de_key}', use_psd={use_psd}")
 
     fallback_labels = None
     all_samples = []
+    n_with_psd = 0
     for sf in subject_files:
         sid = _extract_subject_id(sf.stem)
         labels = subject_label_map.get(sid)
@@ -510,8 +665,16 @@ def load_all_samples_with_saveinfo(data_root, saveinfo_dir=None, n_trials=80,
             if fallback_labels is None:
                 fallback_labels = load_trial_labels(data_root, n_trials)
             labels = fallback_labels
-        all_samples.extend(load_subject_windows(
-            sf, labels, normalize_subject_zscore, label_scheme=label_scheme))
+        rows = load_subject_windows(sf, labels, normalize_subject_zscore,
+                                    label_scheme=label_scheme, de_key=de_key, use_psd=use_psd)
+        n_with_psd += sum(1 for r in rows if r.get("psd") is not None)
+        all_samples.extend(rows)
+    if all_samples:
+        frac = n_with_psd / len(all_samples)
+        if use_psd:
+            print(f"PSD available for {n_with_psd}/{len(all_samples)} windows "
+                  f"({frac*100:.0f}%) -> DE+PSD dual-stream input"
+                  + ("" if frac > 0.99 else "  [WARN] some windows fall back to DE-only"))
     return all_samples
 
 
@@ -545,14 +708,23 @@ class EEGTopoDataset(Dataset):
         self.de = torch.from_numpy(
             np.ascontiguousarray(np.stack([r["de"] for r in rows], axis=0))
         ).to(torch.float32)  # (N, 5, 62)
+        # PSD if every row has it (DE+PSD dual-stream); else None (DE-only).
+        if all(r.get("psd") is not None for r in rows) and len(rows) > 0:
+            self.psd = torch.from_numpy(
+                np.ascontiguousarray(np.stack([r["psd"] for r in rows], axis=0))
+            ).to(torch.float32)  # (N, 5, 62)
+        else:
+            self.psd = None
 
     def __len__(self):
         return int(self.labels.shape[0])
 
     def __getitem__(self, idx):
         de = self.de[idx].numpy()  # (5,62)
-        img = de_window_to_4d(de, self.image_frames, self.image_channels,
-                              self.image_height, self.image_width)  # (frames,C,H,W)
+        psd = self.psd[idx].numpy() if self.psd is not None else None
+        img = feat_window_to_4d(de, self.image_frames, self.image_channels,
+                                self.image_height, self.image_width,
+                                psd_window=psd, use_psd=(psd is not None))  # (frames,C,H,W)
         return {
             "image": torch.from_numpy(img),
             "label": self.labels[idx],

@@ -170,7 +170,14 @@ def build_extra_class_prompts_from_l2(l2_texts, subject_label_map=None,
 
 
 class KLLoss(nn.Module):
-    """KL divergence loss with temperature, ported from utils/KLLoss.py."""
+    """KL divergence loss with temperature, ported from utils/KLLoss.py.
+
+    IMPORTANT: `prediction` must be raw LOGITS (NOT softmax probabilities). The
+    loss applies log_softmax internally. Feeding already-softmaxed probabilities
+    here causes a double-softmax that flattens the gradient (the model's loss
+    barely moves while it overfits) -- the bug fixed in this pipeline.
+    `label` is a one-hot (or soft) target; `label*10` sharpens it toward one-hot.
+    """
 
     def __init__(self):
         super().__init__()
@@ -178,6 +185,6 @@ class KLLoss(nn.Module):
 
     def forward(self, prediction, label):
         batch_size = prediction.shape[0]
-        probs1 = F.log_softmax(prediction, dim=1)
+        probs1 = F.log_softmax(prediction, dim=1)   # prediction = LOGITS
         probs2 = F.softmax(label * 10, dim=1)
         return self.error_metric(probs1, probs2) * batch_size

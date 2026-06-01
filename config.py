@@ -49,6 +49,8 @@ def get_config(num_classes: int = None, label_mode: str = "fine") -> dict:
             "val_split_mode": "subject",         # "subject" | "window"
             "normalize_subject_zscore": True,
             "use_l2_extra_prompts": True,        # migrate CSV L2 trial text as extra prompts
+            "de_key": "de_LDS",                  # "de_LDS" (LDS-smoothed, recommended) | "de" (raw)
+            "use_psd": True,                     # True -> real DE+PSD dual-stream (SEED-VII has psd_i)
             "workers": 2,
         },
 
@@ -62,14 +64,14 @@ def get_config(num_classes: int = None, label_mode: str = "fine") -> dict:
             "tubelet_channels": 1,
             "tubelet_height": 16,
             "tubelet_width": 16,
-            "num_transformer_layers": [2, 2, 2], # [spatial, spectral, temporal]
+            "num_transformer_layers": [2, 2, 0], # [spatial, spectral, temporal] = official SEED yaml
             "embed_dims": 128,
             "num_heads": 4,
             "multi_conv2d_hidden_dims": 128,
             "spatial_type": "Multi_Conv2D",
             "spectral_type": "Legoformer",
             "temporal_type": "Transformer",
-            "attn_dropout": 0.0,
+            "attn_dropout": 0.0,                  # official SEED_train.yaml values below
             "attn_proj_dropout": 0.0,
             "ffn_proj_dropout": 0.1,
             "multi_conv_dropout": 0.1,
@@ -96,13 +98,11 @@ def get_config(num_classes: int = None, label_mode: str = "fine") -> dict:
             "early_patience": 30,
             "start_epoch": 0,
             "lr_type": "Cosine",
-            "lr": 1e-4,
+            "lr": 1e-4,                          # official SEED_train.yaml
             "lr_warmup_step": 5,
             "momentum": 0.9,
-            "weight_decay": 0.003,
+            "weight_decay": 0.003,               # official SEED_train.yaml
             "optim": "AdamW",
-            "loss_type": "KL",                   # "KL" | "CE"
-            "aux_ce_weight": 0.0,                # optional supervised aux head weight
         },
 
         # ----- runtime / Kaggle (ported) -----
@@ -112,7 +112,7 @@ def get_config(num_classes: int = None, label_mode: str = "fine") -> dict:
             "save_every_n_steps": 100,
             "max_train_hours": 8.8,
             "time_buffer_minutes": 8,
-            "amp": False,
+            "amp": True,                         # mixed precision (faster on GPU; ignored on CPU)
             "log_every_n_steps": 20,
             "run_all_folds": False,              # False = only first LOSO fold
         },

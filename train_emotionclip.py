@@ -117,16 +117,28 @@ def build_loaders(train_rows, val_rows, test_rows, cfg):
 
 
 def compute_class_probs(image_emb, text_features, num_text_aug, num_classes):
-    """image_emb: [B, dim]; text_features: [aug*cls, dim] (normalized).
-    Returns class probabilities [B, num_classes]."""
+    """Faithful re-implementation of the OFFICIAL EmotionCLIP forward
+    (trainer_entropy.py):
+
+        similarity = image_emb @ text_features.T          # [B, aug*cls]
+        similarity = similarity.view(B, aug, cls).softmax(dim=-1)  # per-template softmax
+        similarity = similarity.mean(dim=1)               # average over templates
+
+    Returns per-class PROBABILITIES [B, num_classes]. The official code then
+    feeds THESE probabilities directly into CrossEntropyLoss(reduction="sum")
+    against one-hot labels (see train loop). We keep that exact behaviour for
+    fidelity (see MIGRATION.md section on loss).
+    """
     image_emb = image_emb / image_emb.norm(dim=-1, keepdim=True)
-    sim = image_emb @ text_features.t()                          # [B, aug*cls]
+    sim = image_emb @ text_features.t()                              # [B, aug*cls]
     sim = sim.view(image_emb.shape[0], num_text_aug, num_classes).softmax(dim=-1)
-    return sim.mean(dim=1)                                       # [B, num_classes]
+    return sim.mean(dim=1)                                           # [B, num_classes] probs
 
 
 @torch.no_grad()
 def evaluate(eeg_model, text_features, num_text_aug, loader, device, num_classes):
+    """Official inference (trainer_entropy._validate): average per-template
+    softmax similarity, take argmax of the resulting class probabilities."""
     eeg_model.eval()
     confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
     correct, total = 0, 0
@@ -173,13 +185,14 @@ def train_one_fold(train_rows, val_rows, test_rows, fold_name, cfg, device,
     n_params = sum(p.numel() for p in eeg_model.parameters() if p.requires_grad) / 1e6
     print(f"[{fold_name}] EEG tower trainable params: {n_params:.3f}M")
 
-    if solver["loss_type"] == "KL":
-        loss_fn = KLLoss()
-    else:
-        loss_fn = nn.CrossEntropyLoss()
-    aux_ce = nn.CrossEntropyLoss()
+    # OFFICIAL loss (trainer_entropy.py): CrossEntropyLoss(reduction="sum") applied
+    # to the per-template-averaged softmax probabilities vs one-hot labels.
+    # (KLLoss is imported in the official repo but NOT used in its train loop.)
+    loss_fn = nn.CrossEntropyLoss(reduction="sum")
 
-    optimizer = torch.optim.AdamW(eeg_model.parameters(), betas=(0.9, 0.98), eps=1e-8,
+    # Only the EEG image tower is optimized; the text tower is frozen (official).
+    optimizer = torch.optim.AdamW(eeg_model.parameters(),
+                                  betas=(0.9, 0.98), eps=1e-8,
                                   lr=solver["lr"], weight_decay=solver["weight_decay"])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=solver["num_epochs"], eta_min=0)
     scaler = torch.amp.GradScaler("cuda", enabled=(runtime["amp"] and device.type == "cuda"))
@@ -236,14 +249,10 @@ def train_one_fold(train_rows, val_rows, test_rows, fold_name, cfg, device,
 
             with torch.amp.autocast("cuda", enabled=(runtime["amp"] and device.type == "cuda")):
                 emb = eeg_model.encode_image(images)
+                # OFFICIAL: probabilities (per-template softmax, averaged) fed to
+                # CrossEntropyLoss(reduction="sum") against one-hot labels.
                 probs = compute_class_probs(emb, text_features, num_text_aug, num_classes)
-                if solver["loss_type"] == "KL":
-                    loss = loss_fn(probs, labels_onehot)
-                else:
-                    loss = loss_fn(torch.log(probs.clamp_min(1e-9)), labels)
-                if solver["aux_ce_weight"] > 0:
-                    logits = eeg_model(images)
-                    loss = loss + solver["aux_ce_weight"] * aux_ce(logits, labels)
+                loss = loss_fn(probs, labels_onehot)
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -367,7 +376,7 @@ def run_loso(cfg: dict):
     # ---- load EEG samples (labels already mapped to the active scheme) ----
     all_rows = load_all_samples_with_saveinfo(
         d["data_root"], d["saveinfo_dir"], d["n_trials"], d["normalize_subject_zscore"],
-        label_scheme=label_scheme)
+        label_scheme=label_scheme, de_key=d.get("de_key", "de"), use_psd=d.get("use_psd", True))
     subjects = sorted({r["subject"] for r in all_rows})
     print("subjects =", len(subjects), "| total windows =", len(all_rows))
 
