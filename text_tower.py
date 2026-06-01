@@ -98,16 +98,21 @@ class EmotionTextTower(nn.Module):
 
         # Extra groups from migrated CSV L2 trial descriptions.
         # We turn them into uniform-width groups: for each "slot" we need one
-        # prompt per class. We build as many extra groups as the max number of
-        # extra prompts available for any class, filling missing entries with
-        # that class's default emotion word.
+        # prompt per class. We build as many extra groups as the MAX number of
+        # extra prompts available across classes, so NO L2 text is dropped.
+        # Classes that have fewer prompts are CYCLE-FILLED with their own
+        # prompts (round-robin) instead of falling back to the bare emotion
+        # word, keeping every group well-formed without losing information.
         if extra_class_prompts:
             max_extra = max((len(v) for v in extra_class_prompts.values()), default=0)
             for j in range(max_extra):
                 texts = []
                 for ci in range(num_classes):
                     plist = extra_class_prompts.get(ci, [])
-                    texts.append(plist[j] if j < len(plist) else class_words[ci])
+                    if plist:
+                        texts.append(plist[j % len(plist)])   # round-robin fill
+                    else:
+                        texts.append(class_words[ci])          # only if class has no L2 text
                 feats_per_group.append(self._encode(texts, device))
 
         num_text_aug = len(feats_per_group)
@@ -122,12 +127,18 @@ class EmotionTextTower(nn.Module):
 
 def build_extra_class_prompts_from_l2(l2_texts, subject_label_map=None,
                                       trial_label_lookup=None, num_classes=7,
-                                      max_per_class=8):
+                                      max_per_class=None):
     """Map L2 trial descriptions to per-class prompt lists.
 
     trial_label_lookup: dict trial_id -> label index. If not provided we cannot
     assign trial text to a class and return None.
+
+    max_per_class: cap on prompts kept per class. Default None = keep ALL L2
+    texts (no truncation). Set an int only if you intentionally want to limit
+    the prompt ensemble size for speed/memory.
     """
+    if max_per_class is None:
+        max_per_class = len(l2_texts) + 1  # effectively unlimited
     if trial_label_lookup is None:
         return None
     per_class: Dict[int, List[str]] = {c: [] for c in range(num_classes)}
