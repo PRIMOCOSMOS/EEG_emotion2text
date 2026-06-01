@@ -17,10 +17,12 @@ from eeg2text_core import (
     build_default_l2_texts,
     collate_fn,
     ensure_work_dir,
+    emotion_codebook_ortho_loss,
     load_all_samples_with_saveinfo,
     load_two_level_texts_from_csv,
     seed_everything,
     split_train_val,
+    split_train_val_by_subject,
 )
 
 
@@ -32,6 +34,11 @@ def build_loaders(
     l2_texts: Dict[int, str],
 ) -> Tuple[DataLoader, DataLoader]:
     use_pin_memory = torch.cuda.is_available()
+    loader_kwargs = {}
+    if cfg.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = cfg.prefetch_factor
+        loader_kwargs["persistent_workers"] = cfg.persistent_workers
+
     train_ds = EEGTextWindowDataset(train_rows, l1_texts=l1_texts, l2_texts=l2_texts)
     val_ds = EEGTextWindowDataset(val_rows, l1_texts=l1_texts, l2_texts=l2_texts)
     train_loader = DataLoader(
@@ -42,6 +49,7 @@ def build_loaders(
         pin_memory=use_pin_memory,
         collate_fn=collate_fn,
         drop_last=True,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_ds,
@@ -51,6 +59,7 @@ def build_loaders(
         pin_memory=use_pin_memory,
         collate_fn=collate_fn,
         drop_last=False,
+        **loader_kwargs,
     )
     return train_loader, val_loader
 
@@ -87,10 +96,9 @@ def run_epoch(
 
     total_loss = 0.0
     total_acc = 0.0
+    total_gap = 0.0
     n_steps = 0
     timed_out = False
-    epoch_start = time.monotonic()
-    samples_processed = 0
 
     for batch in loader:
         now = time.monotonic()
@@ -128,6 +136,9 @@ def run_epoch(
                     margin_loss_weight=cfg.margin_loss_weight,
                 )
 
+                ortho = emotion_codebook_ortho_loss(text_model.emotion_codebook.weight)
+                loss = loss + cfg.l1_ortho_weight * ortho
+
             if train_mode:
                 optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
@@ -143,6 +154,8 @@ def run_epoch(
                             "global_step": global_step,
                             "eeg_model": eeg_model.state_dict(),
                             "text_proj": text_model.proj.state_dict(),
+                            "text_codebook": text_model.emotion_codebook.state_dict(),
+                            "text_l1_gate": text_model.l1_gate.detach().cpu(),
                             "optimizer": optimizer.state_dict(),
                             "scaler": scaler.state_dict(),
                             "elapsed_seconds": time.monotonic() - start_ts,
@@ -150,28 +163,18 @@ def run_epoch(
                     )
 
         total_loss += loss.item()
-        total_acc += metrics["batch_retrieval_acc"]
+        total_acc += metrics["batch_top1_same_emotion_acc"]
+        total_gap += metrics["batch_sim_gap"]
         n_steps += 1
-        samples_processed += eeg.size(0)
-
-        if train_mode and (n_steps == 1 or n_steps % max(1, cfg.log_every_n_steps) == 0):
-            elapsed = time.monotonic() - epoch_start
-            throughput = samples_processed / elapsed if elapsed > 0 else 0
-            gpu_mem = ""
-            if device.type == "cuda":
-                mem_alloc = torch.cuda.memory_allocated(device) / 1e9
-                mem_res = torch.cuda.memory_reserved(device) / 1e9
-                gpu_mem = f" GPUmem={mem_alloc:.2f}/{mem_res:.2f}GB"
-            print(
-                f"step={n_steps} global_step={global_step} "
-                f"loss={loss.item():.4f} acc={metrics['batch_retrieval_acc']:.4f} "
-                f"samples/s={throughput:.1f}{gpu_mem}"
-            )
 
     if n_steps == 0:
-        stats = {"loss": float("nan"), "retrieval_acc": float("nan")}
+        stats = {"loss": float("nan"), "top1_same_emotion_acc": float("nan"), "sim_gap": float("nan")}
     else:
-        stats = {"loss": total_loss / n_steps, "retrieval_acc": total_acc / n_steps}
+        stats = {
+            "loss": total_loss / n_steps,
+            "top1_same_emotion_acc": total_acc / n_steps,
+            "sim_gap": total_gap / n_steps,
+        }
 
     return stats, timed_out, global_step
 
@@ -205,7 +208,12 @@ def train_one_fold(
     text_model.build_level_caches(l1_texts=l1_texts, l2_texts=l2_texts, dev=device)
     print(f"[Init] Text caches ready: L1={len(l1_texts)} emotions, L2={len(l2_texts)} trials")
 
-    params = list(eeg_model.parameters()) + list(text_model.proj.parameters())
+    params = (
+        list(eeg_model.parameters())
+        + list(text_model.proj.parameters())
+        + list(text_model.emotion_codebook.parameters())
+        + [text_model.l1_gate]
+    )
     optimizer = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(cfg.amp and device.type == "cuda"))
 
@@ -222,7 +230,14 @@ def train_one_fold(
     if loaded is not None:
         eeg_model.load_state_dict(loaded["eeg_model"])
         text_model.proj.load_state_dict(loaded["text_proj"])
-        optimizer.load_state_dict(loaded["optimizer"])
+        if "text_codebook" in loaded:
+            text_model.emotion_codebook.load_state_dict(loaded["text_codebook"])
+        if "text_l1_gate" in loaded:
+            text_model.l1_gate.data.copy_(loaded["text_l1_gate"].to(text_model.l1_gate.device))
+        try:
+            optimizer.load_state_dict(loaded["optimizer"])
+        except Exception as e:
+            print("[Resume] optimizer state incompatible, re-init optimizer:", e)
         if "scaler" in loaded and loaded["scaler"]:
             scaler.load_state_dict(loaded["scaler"])
         start_epoch = int(loaded.get("epoch_completed", 0)) + 1
@@ -282,15 +297,18 @@ def train_one_fold(
         row = {
             "epoch": epoch,
             "train_loss": tr["loss"],
-            "train_ret_acc": tr["retrieval_acc"],
+            "train_acc": tr["top1_same_emotion_acc"],
+            "train_sim_gap": tr["sim_gap"],
             "val_loss": va["loss"],
-            "val_ret_acc": va["retrieval_acc"],
+            "val_acc": va["top1_same_emotion_acc"],
+            "val_sim_gap": va["sim_gap"],
             "global_step": global_step,
         }
         history.append(row)
         print(
             f"[{fold_name}] E{epoch:02d} | train_loss={tr['loss']:.4f} val_loss={va['loss']:.4f} "
-            f"| train_acc={tr['retrieval_acc']:.4f} val_acc={va['retrieval_acc']:.4f}"
+            f"| train_acc={tr['top1_same_emotion_acc']:.4f} val_acc={va['top1_same_emotion_acc']:.4f} "
+            f"| train_gap={tr['sim_gap']:.4f} val_gap={va['sim_gap']:.4f}"
         )
 
         _save_ckpt(
@@ -300,6 +318,8 @@ def train_one_fold(
                 "global_step": global_step,
                 "eeg_model": eeg_model.state_dict(),
                 "text_proj": text_model.proj.state_dict(),
+                "text_codebook": text_model.emotion_codebook.state_dict(),
+                "text_l1_gate": text_model.l1_gate.detach().cpu(),
                 "optimizer": optimizer.state_dict(),
                 "scaler": scaler.state_dict(),
                 "elapsed_seconds": time.monotonic() - start_ts,
@@ -318,6 +338,8 @@ def train_one_fold(
                     "best_val_loss": best_val,
                     "eeg_model": eeg_model.state_dict(),
                     "text_proj": text_model.proj.state_dict(),
+                    "text_codebook": text_model.emotion_codebook.state_dict(),
+                    "text_l1_gate": text_model.l1_gate.detach().cpu(),
                     "cfg": cfg.__dict__,
                 },
             )
@@ -438,11 +460,19 @@ def run_loso(cfg: CFG, run_all_folds: bool = False):
     for test_sub in target_subjects:
         train_pool = [r for r in all_rows if r["subject"] != test_sub]
         test_rows = [r for r in all_rows if r["subject"] == test_sub]
-        train_rows, val_rows = split_train_val(train_pool, cfg.val_ratio)
+        if cfg.val_split_mode == "subject":
+            train_rows, val_rows = split_train_val_by_subject(train_pool, cfg.val_ratio, seed=cfg.seed)
+        else:
+            train_rows, val_rows = split_train_val(train_pool, cfg.val_ratio)
+
+        tr_sub = {r["subject"] for r in train_rows}
+        va_sub = {r["subject"] for r in val_rows}
+        leak_sub = tr_sub.intersection(va_sub)
 
         fold_name = f"loso_test_{test_sub}"
         print("\n===", fold_name, "===")
         print("train/val/test =", len(train_rows), len(val_rows), len(test_rows))
+        print("split mode=", cfg.val_split_mode, "subject_overlap(train,val)=", len(leak_sub))
 
         fold_result = train_one_fold(train_rows, val_rows, fold_name, cfg, device, l1_texts, l2_texts)
         fold_results.append(fold_result)

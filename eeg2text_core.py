@@ -235,17 +235,20 @@ class CFG:
     drop_attn: float = 0.10
 
     # Loss
-    temperature: float = 0.07
-    alpha: float = 0.75
+    temperature: float = 0.12
+    alpha: float = 0.65
 
     # Train
     epochs: int = 20
     batch_size: int = 256
-    lr: float = 2e-4
+    lr: float = 3e-4
     weight_decay: float = 1e-4
     num_workers: int = 2
+    prefetch_factor: int = 4
+    persistent_workers: bool = True
     amp: bool = False
     val_ratio: float = 0.1
+    val_split_mode: str = "subject"  # "subject" or "window"
     seed: int = 42
 
     # Resume and time budget
@@ -263,11 +266,12 @@ class CFG:
     l1_weight: float = 0.4
     l2_weight: float = 0.6
     same_emotion_weight: float = 1.0
-    pos_neg_margin: float = 0.20
-    margin_loss_weight: float = 0.20
+    pos_neg_margin: float = 0.12
+    margin_loss_weight: float = 0.10
     cuda_launch_blocking: bool = False
     force_math_sdp: bool = True
     log_every_n_steps: int = 20
+    l1_ortho_weight: float = 0.02
 
 
 def find_subject_files(data_root: str) -> List[Path]:
@@ -377,17 +381,22 @@ class EEGTextWindowDataset(Dataset):
         self.l1_texts = l1_texts if l1_texts is not None else DEFAULT_L1_TEXTS
         self.l2_texts = l2_texts if l2_texts is not None else DEFAULT_L2_TEXTS
 
+        # Pre-pack arrays once to reduce per-sample CPU overhead in __getitem__.
+        self.eeg = torch.from_numpy(np.stack([r["eeg"] for r in rows], axis=0)).to(torch.float32)
+        self.labels = torch.tensor([int(r["label"]) for r in rows], dtype=torch.long)
+        self.trials = [int(r["trial"]) for r in rows]
+        self.subjects = [str(r["subject"]) for r in rows]
+
     def __len__(self):
-        return len(self.rows)
+        return int(self.labels.shape[0])
 
     def __getitem__(self, idx: int) -> Dict:
-        row = self.rows[idx]
-        x = torch.tensor(row["eeg"], dtype=torch.float32)
-        trial = row["trial"]
+        x = self.eeg[idx]
+        trial = self.trials[idx]
         return {
             "eeg": x,
-            "label": torch.tensor(row["label"], dtype=torch.long),
-            "subject": row["subject"],
+            "label": self.labels[idx],
+            "subject": self.subjects[idx],
             "trial": trial,
         }
 
@@ -412,6 +421,23 @@ def split_train_val(rows: List[Dict], val_ratio: float = 0.1) -> Tuple[List[Dict
             val_rows.append(row)
         else:
             train_rows.append(row)
+    return train_rows, val_rows
+
+
+def split_train_val_by_subject(rows: List[Dict], val_ratio: float = 0.1, seed: int = 42) -> Tuple[List[Dict], List[Dict]]:
+    subjects = sorted(list({str(r["subject"]) for r in rows}))
+    if len(subjects) <= 1:
+        return rows, []
+
+    rng = np.random.default_rng(seed)
+    perm = subjects.copy()
+    rng.shuffle(perm)
+    n_val_sub = max(1, int(round(len(subjects) * val_ratio)))
+    n_val_sub = min(n_val_sub, len(subjects) - 1)
+    val_subjects = set(perm[:n_val_sub])
+
+    train_rows = [r for r in rows if str(r["subject"]) not in val_subjects]
+    val_rows = [r for r in rows if str(r["subject"]) in val_subjects]
     return train_rows, val_rows
 
 
@@ -504,6 +530,11 @@ class TextTower(nn.Module):
         self.encoder.eval()
 
         hidden = self.encoder.config.hidden_size
+        self.hidden_size = hidden
+        self.emotion_codebook = nn.Embedding(len(EMOTION_NAMES), hidden)
+        nn.init.normal_(self.emotion_codebook.weight, mean=0.0, std=0.02)
+        self.l1_gate = nn.Parameter(torch.tensor(0.5))
+
         self.proj = nn.Sequential(
             nn.Linear(hidden, embed_dim),
             nn.GELU(),
@@ -578,11 +609,22 @@ class TextTower(nn.Module):
         trial_ids = torch.as_tensor(trials, dtype=torch.long, device=dev)
         trial_ids = trial_ids.clamp_min(1).clamp_max(self.max_trial_id)
 
-        f1 = self.l1_cache_tensor.index_select(0, lbl)
+        f1_clip = self.l1_cache_tensor.index_select(0, lbl)
+        f1_learn = self.emotion_codebook(lbl)
+        gate = torch.sigmoid(self.l1_gate)
+        f1 = (1.0 - gate) * f1_clip + gate * f1_learn
         f2 = self.l2_cache_tensor.index_select(0, trial_ids)
         fused = l1_weight * f1 + l2_weight * f2
         z = self.proj(fused)
         return F.normalize(z, dim=-1)
+
+
+def emotion_codebook_ortho_loss(codebook_weight: torch.Tensor) -> torch.Tensor:
+    # Encourage emotion prototypes to avoid collapsing to a near-collinear subspace.
+    w = F.normalize(codebook_weight, dim=1)
+    gram = w @ w.t()
+    eye = torch.eye(gram.size(0), device=gram.device, dtype=gram.dtype)
+    return ((gram - eye) ** 2).mean()
 
     def forward(self, text_l1: List[str], text_l2: List[str], dev: torch.device, l1_weight: float = 0.4, l2_weight: float = 0.6) -> torch.Tensor:
         f1 = self._encode_text(text_l1, dev)
@@ -632,8 +674,8 @@ def asymmetric_soft_contrastive_loss(
     alpha: float,
     labels: torch.Tensor,
     same_emotion_weight: float = 1.0,
-    pos_neg_margin: float = 0.20,
-    margin_loss_weight: float = 0.20,
+    pos_neg_margin: float = 0.12,
+    margin_loss_weight: float = 0.10,
 ):
     logits = (eeg_z @ txt_z.t()) / temperature
 
@@ -664,11 +706,20 @@ def asymmetric_soft_contrastive_loss(
     loss = base_loss + margin_loss_weight * margin_loss
 
     with torch.no_grad():
-        # Keep a simple retrieval metric for monitoring.
-        hard_target = torch.arange(logits.size(0), device=logits.device)
+        # Metric aligned with current objective:
+        # top-1 match is counted correct if predicted pair has the same emotion label.
         pred = logits.argmax(dim=1)
-        acc = (pred == hard_target).float().mean().item()
-    return loss, {"batch_retrieval_acc": acc}
+        top1_same_emotion = (labels[pred] == labels).float().mean().item()
+
+        pos_mask = (labels.unsqueeze(1) == labels.unsqueeze(0)).float()
+        neg_mask = 1.0 - pos_mask
+        pos_cnt = pos_mask.sum(dim=1).clamp_min(1.0)
+        neg_cnt = neg_mask.sum(dim=1).clamp_min(1.0)
+        s_pos = (sim * pos_mask).sum(dim=1) / pos_cnt
+        s_neg = (sim * neg_mask).sum(dim=1) / neg_cnt
+        sim_gap = (s_pos - s_neg).mean().item()
+
+    return loss, {"batch_top1_same_emotion_acc": top1_same_emotion, "batch_sim_gap": sim_gap}
 
 
 def ensure_work_dir(work_dir: str) -> None:
