@@ -69,8 +69,105 @@ def emotion_name_to_label(name: str) -> int:
     return EMOTION_NAMES.index(normalize_emotion_name(name))
 
 
+# --------------------------------------------------------------------------- #
+# Label scheme: configurable 7-class (fine) <-> 3-class valence aggregation.
+# --------------------------------------------------------------------------- #
+# Default valence mapping of the 7 SEED-VII emotions -> {negative, neutral, positive}.
+# `surprise` is treated as positive by default (SEED-VII film-elicited surprise is
+# mostly pleasant amazement); this is configurable via VALENCE_GROUPS below.
+VALENCE_NAMES = ["negative", "neutral", "positive"]
+
+VALENCE_GROUPS = {
+    "negative": ["sadness", "fear", "disgust", "anger"],
+    "neutral":  ["neutral"],
+    "positive": ["joy", "surprise"],
+}
+
+# Class words used to render CLIP prompts for the 3-class valence scheme.
+VALENCE_PROMPT_WORD = {
+    "negative": "negative",
+    "neutral": "neutral",
+    "positive": "positive",
+}
+
+
+def _fine_to_valence_index_map(valence_groups: Dict[str, List[str]]) -> List[int]:
+    """Return a length-7 list mapping fine label idx -> valence label idx
+    (index into VALENCE_NAMES)."""
+    emo_to_val = {}
+    for vname, emos in valence_groups.items():
+        vi = VALENCE_NAMES.index(vname)
+        for e in emos:
+            emo_to_val[normalize_emotion_name(e)] = vi
+    mapping = []
+    for emo in EMOTION_NAMES:
+        if emo not in emo_to_val:
+            raise ValueError(f"Emotion '{emo}' is not assigned to any valence group.")
+        mapping.append(emo_to_val[emo])
+    return mapping
+
+
+class LabelScheme:
+    """Encapsulates the active label space and the fine(7)->active mapping.
+
+    mode = "fine"    -> 7 classes (neutral, joy, sadness, fear, disgust, anger, surprise)
+    mode = "valence" -> 3 classes (negative, neutral, positive), aggregated from fine.
+
+    The data pipeline ALWAYS parses raw 7-class labels first; this scheme then
+    maps them to the active label space. So switching modes never touches the
+    Saveinfo/CSV parsing or the EEG data.
+    """
+
+    def __init__(self, mode: str = "fine", valence_groups: Optional[Dict[str, List[str]]] = None):
+        mode = (mode or "fine").lower()
+        if mode not in ("fine", "valence"):
+            raise ValueError(f"label scheme mode must be 'fine' or 'valence', got {mode!r}")
+        self.mode = mode
+        self.valence_groups = valence_groups or VALENCE_GROUPS
+        if mode == "valence":
+            self.names = list(VALENCE_NAMES)
+            self.prompt_word = dict(VALENCE_PROMPT_WORD)
+            self._fine2active = _fine_to_valence_index_map(self.valence_groups)
+        else:
+            self.names = list(EMOTION_NAMES)
+            self.prompt_word = dict(EMOTION_PROMPT_WORD)
+            self._fine2active = list(range(len(EMOTION_NAMES)))
+
+    @property
+    def num_classes(self) -> int:
+        return len(self.names)
+
+    def map_fine(self, fine_label: int) -> int:
+        """Map a raw 7-class label index to the active label index."""
+        fine_label = int(max(0, min(int(fine_label), len(EMOTION_NAMES) - 1)))
+        return self._fine2active[fine_label]
+
+    def class_prompt_words(self) -> List[str]:
+        return [self.prompt_word[n] for n in self.names]
+
+    def describe(self) -> str:
+        if self.mode == "fine":
+            return f"LabelScheme(mode=fine, {self.num_classes} classes: {self.names})"
+        grp = {v: self.valence_groups[v] for v in VALENCE_NAMES}
+        return (f"LabelScheme(mode=valence, {self.num_classes} classes: {self.names}; "
+                f"groups={grp})")
+
+
+def make_label_scheme(cfg_data: dict) -> "LabelScheme":
+    """Build a LabelScheme from the cfg['data'] dict.
+
+    Recognized keys:
+      label_mode: "fine" | "valence"  (default "fine")
+      valence_groups: optional {valence_name: [emotion,...]} override
+    """
+    mode = cfg_data.get("label_mode", "fine")
+    groups = cfg_data.get("valence_groups", None)
+    return LabelScheme(mode=mode, valence_groups=groups)
+
+
 def class_prompt_words(num_classes: int = 7) -> List[str]:
-    """Return the list of class words for the active label set."""
+    """Backward-compatible helper: return class words for the FINE scheme
+    (truncated to num_classes). Prefer LabelScheme.class_prompt_words()."""
     return [EMOTION_PROMPT_WORD[e] for e in EMOTION_NAMES[:num_classes]]
 
 
@@ -353,7 +450,8 @@ def de_window_to_4d(de_window: np.ndarray, image_frames: int, image_channels: in
 # Subject window loading (ported + z-score), now storing raw DE windows.
 # --------------------------------------------------------------------------- #
 def load_subject_windows(subject_file: Path, trial_labels: np.ndarray,
-                         normalize_subject_zscore: bool = True) -> List[Dict]:
+                         normalize_subject_zscore: bool = True,
+                         label_scheme: Optional["LabelScheme"] = None) -> List[Dict]:
     mat = sio.loadmat(subject_file)
     trial_data = []
     for trial_idx in range(1, len(trial_labels) + 1):
@@ -363,7 +461,8 @@ def load_subject_windows(subject_file: Path, trial_labels: np.ndarray,
         arr = np.asarray(mat[key], dtype=np.float32)  # (T,5,62)
         if arr.ndim != 3:
             continue
-        label = int(max(0, min(int(trial_labels[trial_idx - 1]), len(EMOTION_NAMES) - 1)))
+        fine = int(max(0, min(int(trial_labels[trial_idx - 1]), len(EMOTION_NAMES) - 1)))
+        label = label_scheme.map_fine(fine) if label_scheme is not None else fine
         trial_data.append((trial_idx, arr, label))
 
     if normalize_subject_zscore and trial_data:
@@ -385,7 +484,8 @@ def load_subject_windows(subject_file: Path, trial_labels: np.ndarray,
 
 
 def load_all_samples_with_saveinfo(data_root, saveinfo_dir=None, n_trials=80,
-                                   normalize_subject_zscore=True) -> List[Dict]:
+                                   normalize_subject_zscore=True,
+                                   label_scheme: Optional["LabelScheme"] = None) -> List[Dict]:
     data_root = _normalize_kaggle_input_path(data_root)
     if saveinfo_dir:
         saveinfo_dir = _normalize_kaggle_input_path(saveinfo_dir)
@@ -398,6 +498,8 @@ def load_all_samples_with_saveinfo(data_root, saveinfo_dir=None, n_trials=80,
     subject_label_map = build_subject_label_map_from_saveinfo(
         data_root, saveinfo_dir, n_trials, verbose=True)
     print(f"saveinfo subjects parsed: {len(subject_label_map)}")
+    if label_scheme is not None:
+        print(f"label scheme: {label_scheme.describe()}")
 
     fallback_labels = None
     all_samples = []
@@ -408,7 +510,8 @@ def load_all_samples_with_saveinfo(data_root, saveinfo_dir=None, n_trials=80,
             if fallback_labels is None:
                 fallback_labels = load_trial_labels(data_root, n_trials)
             labels = fallback_labels
-        all_samples.extend(load_subject_windows(sf, labels, normalize_subject_zscore))
+        all_samples.extend(load_subject_windows(
+            sf, labels, normalize_subject_zscore, label_scheme=label_scheme))
     return all_samples
 
 

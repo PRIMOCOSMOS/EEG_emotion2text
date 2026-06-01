@@ -31,7 +31,7 @@ from torch.utils.data import DataLoader
 
 from config import get_config, discover_data_paths
 from data_seedvii import (
-    EMOTION_NAMES, class_prompt_words,
+    EMOTION_NAMES, class_prompt_words, make_label_scheme,
     load_all_samples_with_saveinfo, load_two_level_texts_from_csv,
     build_subject_label_map_from_saveinfo, build_default_l2_texts,
     EEGTopoDataset, collate_fn, split_train_val, split_train_val_by_subject,
@@ -60,8 +60,13 @@ def _extract_subject_id_from_stem(stem: str):
     return int(nums[0]) if nums else None
 
 
-def _build_trial_label_lookup(sub_label_map, allowed_subject_ids, n_trials):
+def _build_trial_label_lookup(sub_label_map, allowed_subject_ids, n_trials, label_scheme=None):
     """Majority-vote trial->label mapping using ONLY the allowed (training) subjects.
+
+    `sub_label_map` holds raw FINE (7-class) labels parsed from Saveinfo. The
+    majority vote is done in fine space, then mapped to the ACTIVE label space
+    (fine or aggregated valence) via `label_scheme` so the L2 prompt assignment
+    matches the classes the model is trained on.
 
     This keeps the L2 prompt assignment strictly leakage-free under LOSO: the
     held-out test subject's Saveinfo is excluded from the vote.
@@ -73,7 +78,8 @@ def _build_trial_label_lookup(sub_label_map, allowed_subject_ids, n_trials):
         stacked = np.stack([a[:n_trials] for a in arrs], axis=0)
         for t in range(n_trials):
             vals, counts = np.unique(stacked[:, t], return_counts=True)
-            lookup[t + 1] = int(vals[np.argmax(counts)])
+            fine = int(vals[np.argmax(counts)])
+            lookup[t + 1] = label_scheme.map_fine(fine) if label_scheme is not None else fine
     return lookup
 
 
@@ -328,10 +334,14 @@ def run_loso(cfg: dict):
         print("GPU:", torch.cuda.get_device_name(0))
 
     d = cfg["data"]
-    num_classes = d["num_classes"]
+    # Build the (configurable) label scheme: fine 7-class or aggregated valence 3-class.
+    label_scheme = make_label_scheme(d)
+    num_classes = label_scheme.num_classes
+    d["num_classes"] = num_classes  # keep cfg consistent with the active scheme
     print("resolved data_root   :", d["data_root"])
     print("resolved saveinfo_dir:", d["saveinfo_dir"])
     print("resolved text_csv    :", d["text_csv_path"])
+    print(label_scheme.describe())
 
     # ---- text protocol (CSV migrated): L2 trial descriptions ----
     # NOTE on data-leakage: the trial->emotion mapping used to assign L2 text to
@@ -352,11 +362,12 @@ def run_loso(cfg: dict):
     assert text_tower.clip_embed_dim == cfg["network"]["clip_embed_dim"], (
         f"clip_embed_dim mismatch: CLIP={text_tower.clip_embed_dim}, "
         f"cfg={cfg['network']['clip_embed_dim']}")
-    words = class_prompt_words(num_classes)
+    words = label_scheme.class_prompt_words()
 
-    # ---- load EEG samples ----
+    # ---- load EEG samples (labels already mapped to the active scheme) ----
     all_rows = load_all_samples_with_saveinfo(
-        d["data_root"], d["saveinfo_dir"], d["n_trials"], d["normalize_subject_zscore"])
+        d["data_root"], d["saveinfo_dir"], d["n_trials"], d["normalize_subject_zscore"],
+        label_scheme=label_scheme)
     subjects = sorted({r["subject"] for r in all_rows})
     print("subjects =", len(subjects), "| total windows =", len(all_rows))
 
@@ -383,7 +394,7 @@ def run_loso(cfg: dict):
         extra_prompts = None
         if d["use_l2_extra_prompts"] and l2_texts and sub_label_map:
             trial_label_lookup = _build_trial_label_lookup(
-                sub_label_map, train_subject_ids, d["n_trials"])
+                sub_label_map, train_subject_ids, d["n_trials"], label_scheme=label_scheme)
             extra_prompts = build_extra_class_prompts_from_l2(
                 l2_texts, trial_label_lookup=trial_label_lookup, num_classes=num_classes)
             print("L2 extra prompt classes (train-only):",
@@ -409,5 +420,6 @@ def run_loso(cfg: dict):
 
 
 if __name__ == "__main__":
-    config = get_config(num_classes=7)
+    # label_mode="fine" -> 7-class; label_mode="valence" -> 3-class (neg/neu/pos)
+    config = get_config(label_mode="fine")
     run_loso(config)

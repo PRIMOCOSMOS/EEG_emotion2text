@@ -13,7 +13,23 @@ import os
 from copy import deepcopy
 
 
-def get_config(num_classes: int = 7) -> dict:
+def get_config(num_classes: int = None, label_mode: str = "fine") -> dict:
+    """Build the default config.
+
+    label_mode:
+        "fine"    -> 7-class SEED-VII emotions (neutral/joy/sadness/fear/
+                     disgust/anger/surprise).
+        "valence" -> 3-class valence aggregation (negative/neutral/positive),
+                     derived from the 7 emotions (see data_seedvii.VALENCE_GROUPS).
+
+    num_classes is normally inferred from label_mode (7 or 3). You may still pass
+    it explicitly to override (e.g. for SEED-IV=4 / SEED=3 fine-grained sets),
+    but for SEED-VII just set label_mode.
+    """
+    label_mode = (label_mode or "fine").lower()
+    inferred = 3 if label_mode == "valence" else 7
+    if num_classes is None:
+        num_classes = inferred
     cfg = {
         "random_seed": 42,
         "multi_gpu": False,
@@ -21,7 +37,9 @@ def get_config(num_classes: int = 7) -> dict:
         # ----- data / paths (SEED-VII protocol, ported) -----
         "data": {
             "dataset": "SEED-VII",
-            "num_classes": num_classes,          # 7 (SEED-VII) / 4 (SEED-IV) / 3 (SEED)
+            "num_classes": num_classes,          # auto: 7 (fine) / 3 (valence)
+            "label_mode": label_mode,            # "fine" | "valence"
+            "valence_groups": None,              # None=default mapping; or {neg/neu/pos: [...]}
             "n_trials": 80,
             "num_shot": 0,                       # few-shot from target subject (0 = zero-shot)
             "data_root": "/kaggle/input/datasets/primocosmos/seed-vii-kaggle/EEG_features",
