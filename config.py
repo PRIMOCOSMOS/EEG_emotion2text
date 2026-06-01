@@ -32,7 +32,7 @@ def get_config(num_classes: int = None, label_mode: str = "fine") -> dict:
         num_classes = inferred
     cfg = {
         "random_seed": 42,
-        "multi_gpu": False,
+        "multi_gpu": True,
 
         # ----- data / paths (SEED-VII protocol, ported) -----
         "data": {
@@ -71,14 +71,14 @@ def get_config(num_classes: int = None, label_mode: str = "fine") -> dict:
             "spatial_type": "Multi_Conv2D",
             "spectral_type": "Legoformer",
             "temporal_type": "Transformer",
-            "attn_dropout": 0.0,                  # official SEED_train.yaml values below
-            "attn_proj_dropout": 0.0,
-            "ffn_proj_dropout": 0.1,
-            "multi_conv_dropout": 0.1,
-            "drop_path_rate": 0.1,
+            "attn_dropout": 0.3,                  # official SEED_train.yaml values below
+            "attn_proj_dropout": 0.3,
+            "ffn_proj_dropout": 0.4,
+            "multi_conv_dropout": 0.3,
+            "drop_path_rate": 0.3,
             "dropout_after_pos_embed": 0.3,
             "conv_type": "Conv_Stem",
-            "use_spectral_pos_embedding": False,
+            "use_spectral_pos_embedding": True,
             "clip_embed_dim": 512,               # must match CLIP text projection dim
         },
 
@@ -90,18 +90,18 @@ def get_config(num_classes: int = None, label_mode: str = "fine") -> dict:
 
         # ----- optimization -----
         "solver": {
-            "train_batch_size": 64,
-            "val_batch_size": 64,
-            "num_epochs": 100,
+            "train_batch_size": 512,
+            "val_batch_size": 512,
+            "num_epochs": 150,
             "eval_every_n_epochs": 1,            # run val+test every N epochs (speed)
             "is_early_patience": True,
-            "early_patience": 30,
+            "early_patience": 50,
             "start_epoch": 0,
             "lr_type": "Cosine",
             "lr": 1e-4,                          # official SEED_train.yaml
             "lr_warmup_step": 5,
             "momentum": 0.9,
-            "weight_decay": 0.003,               # official SEED_train.yaml
+            "weight_decay": 0.1,               # official SEED_train.yaml
             "optim": "AdamW",
         },
 
