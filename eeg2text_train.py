@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from eeg2text_core import (
@@ -80,6 +81,7 @@ def run_epoch(
     train_mode: bool,
     eeg_model: EEGEncoder,
     text_model: TextTower,
+    cls_head: torch.nn.Module,
     loader: DataLoader,
     optimizer,
     scaler,
@@ -93,10 +95,13 @@ def run_epoch(
 ):
     eeg_model.train(mode=train_mode)
     text_model.train(mode=train_mode)
+    cls_head.train(mode=train_mode)
 
     total_loss = 0.0
     total_acc = 0.0
     total_gap = 0.0
+    total_proto_acc = 0.0
+    total_cls_acc = 0.0
     n_steps = 0
     timed_out = False
 
@@ -137,7 +142,15 @@ def run_epoch(
                 )
 
                 ortho = emotion_codebook_ortho_loss(text_model.emotion_codebook.weight)
-                loss = loss + cfg.l1_ortho_weight * ortho
+                cls_logits = cls_head(eeg_z)
+                ce = F.cross_entropy(cls_logits, labels)
+                loss = loss + cfg.l1_ortho_weight * ortho + cfg.ce_loss_weight * ce
+
+                with torch.no_grad():
+                    proto = text_model.get_emotion_prototypes(device)
+                    proto_logits = eeg_z @ proto.t()
+                    proto_acc = (proto_logits.argmax(dim=1) == labels).float().mean().item()
+                    cls_acc = (cls_logits.argmax(dim=1) == labels).float().mean().item()
 
             if train_mode:
                 optimizer.zero_grad(set_to_none=True)
@@ -156,6 +169,7 @@ def run_epoch(
                             "text_proj": text_model.proj.state_dict(),
                             "text_codebook": text_model.emotion_codebook.state_dict(),
                             "text_l1_gate": text_model.l1_gate.detach().cpu(),
+                            "cls_head": cls_head.state_dict(),
                             "optimizer": optimizer.state_dict(),
                             "scaler": scaler.state_dict(),
                             "elapsed_seconds": time.monotonic() - start_ts,
@@ -165,15 +179,25 @@ def run_epoch(
         total_loss += loss.item()
         total_acc += metrics["batch_top1_same_emotion_acc"]
         total_gap += metrics["batch_sim_gap"]
+        total_proto_acc += proto_acc
+        total_cls_acc += cls_acc
         n_steps += 1
 
     if n_steps == 0:
-        stats = {"loss": float("nan"), "top1_same_emotion_acc": float("nan"), "sim_gap": float("nan")}
+        stats = {
+            "loss": float("nan"),
+            "top1_same_emotion_acc": float("nan"),
+            "sim_gap": float("nan"),
+            "proto_acc": float("nan"),
+            "cls_acc": float("nan"),
+        }
     else:
         stats = {
             "loss": total_loss / n_steps,
             "top1_same_emotion_acc": total_acc / n_steps,
             "sim_gap": total_gap / n_steps,
+            "proto_acc": total_proto_acc / n_steps,
+            "cls_acc": total_cls_acc / n_steps,
         }
 
     return stats, timed_out, global_step
@@ -182,6 +206,7 @@ def run_epoch(
 def train_one_fold(
     train_rows: List[Dict],
     val_rows: List[Dict],
+    test_rows: List[Dict],
     fold_name: str,
     cfg: CFG,
     device: torch.device,
@@ -191,7 +216,22 @@ def train_one_fold(
     ensure_work_dir(cfg.work_dir)
     print(f"[Init] building dataloaders, num_workers={cfg.num_workers}, batch_size={cfg.batch_size}")
     train_loader, val_loader = build_loaders(train_rows, val_rows, cfg, l1_texts=l1_texts, l2_texts=l2_texts)
-    print(f"[Init] dataloaders ready, train_steps={len(train_loader)}, val_steps={len(val_loader)}")
+    test_ds = EEGTextWindowDataset(test_rows, l1_texts=l1_texts, l2_texts=l2_texts)
+    test_loader_kwargs = {}
+    if cfg.num_workers > 0:
+        test_loader_kwargs["prefetch_factor"] = cfg.prefetch_factor
+        test_loader_kwargs["persistent_workers"] = cfg.persistent_workers
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=collate_fn,
+        drop_last=False,
+        **test_loader_kwargs,
+    )
+    print(f"[Init] dataloaders ready, train_steps={len(train_loader)}, val_steps={len(val_loader)}, test_steps={len(test_loader)}")
 
     eeg_model = EEGEncoder(
         f1=cfg.f1,
@@ -204,6 +244,7 @@ def train_one_fold(
     ).to(device)
     print("[Init] EEG model ready")
     text_model = TextTower(cfg.clip_name, embed_dim=cfg.embed_dim, max_len=cfg.max_text_len).to(device)
+    cls_head = torch.nn.Linear(cfg.embed_dim, 7).to(device)
     print("[Init] Text model ready")
     text_model.build_level_caches(l1_texts=l1_texts, l2_texts=l2_texts, dev=device)
     print(f"[Init] Text caches ready: L1={len(l1_texts)} emotions, L2={len(l2_texts)} trials")
@@ -213,6 +254,7 @@ def train_one_fold(
         + list(text_model.proj.parameters())
         + list(text_model.emotion_codebook.parameters())
         + [text_model.l1_gate]
+        + list(cls_head.parameters())
     )
     optimizer = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(cfg.amp and device.type == "cuda"))
@@ -234,6 +276,8 @@ def train_one_fold(
             text_model.emotion_codebook.load_state_dict(loaded["text_codebook"])
         if "text_l1_gate" in loaded:
             text_model.l1_gate.data.copy_(loaded["text_l1_gate"].to(text_model.l1_gate.device))
+        if "cls_head" in loaded:
+            cls_head.load_state_dict(loaded["cls_head"])
         try:
             optimizer.load_state_dict(loaded["optimizer"])
         except Exception as e:
@@ -261,6 +305,7 @@ def train_one_fold(
             True,
             eeg_model,
             text_model,
+            cls_head,
             train_loader,
             optimizer,
             scaler,
@@ -282,7 +327,25 @@ def train_one_fold(
             False,
             eeg_model,
             text_model,
+            cls_head,
             val_loader,
+            optimizer,
+            scaler,
+            cfg,
+            device,
+            start_ts,
+            stop_ts,
+            epoch,
+            global_step,
+            latest_ckpt,
+        )
+
+        te, _, global_step = run_epoch(
+            False,
+            eeg_model,
+            text_model,
+            cls_head,
+            test_loader,
             optimizer,
             scaler,
             cfg,
@@ -299,15 +362,22 @@ def train_one_fold(
             "train_loss": tr["loss"],
             "train_acc": tr["top1_same_emotion_acc"],
             "train_sim_gap": tr["sim_gap"],
+            "train_proto_acc": tr["proto_acc"],
+            "train_cls_acc": tr["cls_acc"],
             "val_loss": va["loss"],
             "val_acc": va["top1_same_emotion_acc"],
             "val_sim_gap": va["sim_gap"],
+            "val_proto_acc": va["proto_acc"],
+            "val_cls_acc": va["cls_acc"],
+            "test_proto_acc": te["proto_acc"],
+            "test_cls_acc": te["cls_acc"],
             "global_step": global_step,
         }
         history.append(row)
         print(
             f"[{fold_name}] E{epoch:02d} | train_loss={tr['loss']:.4f} val_loss={va['loss']:.4f} "
-            f"| train_acc={tr['top1_same_emotion_acc']:.4f} val_acc={va['top1_same_emotion_acc']:.4f} "
+            f"| train_proto={tr['proto_acc']:.4f} val_proto={va['proto_acc']:.4f} test_proto={te['proto_acc']:.4f} "
+            f"| train_cls={tr['cls_acc']:.4f} val_cls={va['cls_acc']:.4f} test_cls={te['cls_acc']:.4f} "
             f"| train_gap={tr['sim_gap']:.4f} val_gap={va['sim_gap']:.4f}"
         )
 
@@ -320,6 +390,7 @@ def train_one_fold(
                 "text_proj": text_model.proj.state_dict(),
                 "text_codebook": text_model.emotion_codebook.state_dict(),
                 "text_l1_gate": text_model.l1_gate.detach().cpu(),
+                "cls_head": cls_head.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scaler": scaler.state_dict(),
                 "elapsed_seconds": time.monotonic() - start_ts,
@@ -340,6 +411,7 @@ def train_one_fold(
                     "text_proj": text_model.proj.state_dict(),
                     "text_codebook": text_model.emotion_codebook.state_dict(),
                     "text_l1_gate": text_model.l1_gate.detach().cpu(),
+                    "cls_head": cls_head.state_dict(),
                     "cfg": cfg.__dict__,
                 },
             )
@@ -448,7 +520,11 @@ def run_loso(cfg: CFG, run_all_folds: bool = False):
         l2_texts = build_default_l2_texts(80)
         print("text protocol csv not found, fallback to template text.")
 
-    all_rows = load_all_samples_with_saveinfo(data_root, saveinfo_dir=saveinfo_dir)
+    all_rows = load_all_samples_with_saveinfo(
+        data_root,
+        saveinfo_dir=saveinfo_dir,
+        normalize_subject_zscore=cfg.normalize_subject_zscore,
+    )
     subjects = sorted(list({r["subject"] for r in all_rows}))
 
     target_subjects = subjects if run_all_folds else subjects[:1]
@@ -474,7 +550,7 @@ def run_loso(cfg: CFG, run_all_folds: bool = False):
         print("train/val/test =", len(train_rows), len(val_rows), len(test_rows))
         print("split mode=", cfg.val_split_mode, "subject_overlap(train,val)=", len(leak_sub))
 
-        fold_result = train_one_fold(train_rows, val_rows, fold_name, cfg, device, l1_texts, l2_texts)
+        fold_result = train_one_fold(train_rows, val_rows, test_rows, fold_name, cfg, device, l1_texts, l2_texts)
         fold_results.append(fold_result)
 
     result_path = os.path.join(cfg.work_dir, "loso_results.json")

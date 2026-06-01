@@ -235,20 +235,21 @@ class CFG:
     drop_attn: float = 0.10
 
     # Loss
-    temperature: float = 0.12
-    alpha: float = 0.65
+    temperature: float = 0.15
+    alpha: float = 0.55
 
     # Train
     epochs: int = 20
     batch_size: int = 256
-    lr: float = 3e-4
-    weight_decay: float = 1e-4
+    lr: float = 2e-4
+    weight_decay: float = 5e-4
     num_workers: int = 2
     prefetch_factor: int = 4
     persistent_workers: bool = True
     amp: bool = False
     val_ratio: float = 0.1
     val_split_mode: str = "subject"  # "subject" or "window"
+    normalize_subject_zscore: bool = True
     seed: int = 42
 
     # Resume and time budget
@@ -266,12 +267,13 @@ class CFG:
     l1_weight: float = 0.4
     l2_weight: float = 0.6
     same_emotion_weight: float = 1.0
-    pos_neg_margin: float = 0.12
-    margin_loss_weight: float = 0.10
+    pos_neg_margin: float = 0.08
+    margin_loss_weight: float = 0.05
     cuda_launch_blocking: bool = False
     force_math_sdp: bool = True
     log_every_n_steps: int = 20
-    l1_ortho_weight: float = 0.02
+    l1_ortho_weight: float = 0.01
+    ce_loss_weight: float = 0.40
 
 
 def find_subject_files(data_root: str) -> List[Path]:
@@ -308,9 +310,10 @@ def load_trial_labels(data_root: str, n_trials: int = 80) -> np.ndarray:
     raise FileNotFoundError("未找到 trial label 文件，请在 data_root 下提供 label .mat。")
 
 
-def load_subject_windows(subject_file: Path, trial_labels: np.ndarray) -> List[Dict]:
+def load_subject_windows(subject_file: Path, trial_labels: np.ndarray, normalize_subject_zscore: bool = True) -> List[Dict]:
     mat = sio.loadmat(subject_file)
     samples = []
+    trial_data = []
 
     for trial_idx in range(1, len(trial_labels) + 1):
         key = f"de_{trial_idx}"
@@ -325,6 +328,19 @@ def load_subject_windows(subject_file: Path, trial_labels: np.ndarray) -> List[D
         label = int(trial_labels[trial_idx - 1])
         label = max(0, min(label, len(EMOTION_NAMES) - 1))
 
+        trial_data.append((trial_idx, arr, label))
+
+    if normalize_subject_zscore and len(trial_data) > 0:
+        all_win = np.concatenate([x[1] for x in trial_data], axis=0)  # (N,62,5)
+        mu = all_win.mean(axis=0, keepdims=True)
+        sigma = all_win.std(axis=0, keepdims=True)
+        sigma = np.clip(sigma, 1e-6, None)
+        normed = []
+        for trial_idx, arr, label in trial_data:
+            normed.append((trial_idx, (arr - mu) / sigma, label))
+        trial_data = normed
+
+    for trial_idx, arr, label in trial_data:
         for t in range(arr.shape[0]):
             samples.append(
                 {
@@ -338,11 +354,15 @@ def load_subject_windows(subject_file: Path, trial_labels: np.ndarray) -> List[D
     return samples
 
 
-def load_all_samples(data_root: str) -> List[Dict]:
-    return load_all_samples_with_saveinfo(data_root=data_root, saveinfo_dir=None)
+def load_all_samples(data_root: str, normalize_subject_zscore: bool = True) -> List[Dict]:
+    return load_all_samples_with_saveinfo(data_root=data_root, saveinfo_dir=None, normalize_subject_zscore=normalize_subject_zscore)
 
 
-def load_all_samples_with_saveinfo(data_root: str, saveinfo_dir: Optional[str] = None) -> List[Dict]:
+def load_all_samples_with_saveinfo(
+    data_root: str,
+    saveinfo_dir: Optional[str] = None,
+    normalize_subject_zscore: bool = True,
+) -> List[Dict]:
     data_root = _normalize_kaggle_input_path(data_root)
     if saveinfo_dir:
         saveinfo_dir = _normalize_kaggle_input_path(saveinfo_dir)
@@ -366,7 +386,7 @@ def load_all_samples_with_saveinfo(data_root: str, saveinfo_dir: Optional[str] =
             if fallback_labels is None:
                 fallback_labels = load_trial_labels(data_root, n_trials=80)
             labels = fallback_labels
-        all_samples.extend(load_subject_windows(sf, labels))
+        all_samples.extend(load_subject_windows(sf, labels, normalize_subject_zscore=normalize_subject_zscore))
     return all_samples
 
 
@@ -617,6 +637,18 @@ class TextTower(nn.Module):
         fused = l1_weight * f1 + l2_weight * f2
         z = self.proj(fused)
         return F.normalize(z, dim=-1)
+
+    def get_emotion_prototypes(self, dev: torch.device) -> torch.Tensor:
+        if self.l1_cache_tensor is None:
+            raise RuntimeError("Text caches are not built. Call build_level_caches(...) before training.")
+
+        emo_ids = torch.arange(len(EMOTION_NAMES), device=dev, dtype=torch.long)
+        f1_clip = self.l1_cache_tensor.to(dev)
+        f1_learn = self.emotion_codebook(emo_ids)
+        gate = torch.sigmoid(self.l1_gate)
+        f1 = (1.0 - gate) * f1_clip + gate * f1_learn
+        proto = self.proj(f1)
+        return F.normalize(proto, dim=-1)
 
 
 def emotion_codebook_ortho_loss(codebook_weight: torch.Tensor) -> torch.Tensor:

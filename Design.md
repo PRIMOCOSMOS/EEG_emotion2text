@@ -57,6 +57,15 @@ z_text = normalize(Proj( w1 * f(L1) + w2 * f(L2) ))
 默认: w1=0.4, w2=0.6
 ```
 
+为缓解 L1 文本在 CLIP 空间可能共线的问题，引入可训练的情绪原型码本：
+
+```
+f1 = (1-g) * f1_clip + g * f1_codebook
+g = sigmoid(trainable_scalar)
+```
+
+并加入码本正交约束，鼓励不同情绪原型分离。
+
 ---
 
 ## 四、模型架构
@@ -100,6 +109,16 @@ L = alpha * L_eeg2text + (1-alpha) * L_text2eeg + lambda * L_margin
 默认: alpha=0.75, lambda=0.20
 ```
 
+### 5.3 辅助分类头（新增）
+
+为提升跨被试测试准确率，在 EEG 嵌入上增加 7 类情绪分类头：
+
+```
+L_total = L_contrastive + lambda_margin * L_margin + lambda_ortho * L_ortho + beta * L_ce
+```
+
+其中 `L_ce` 为分类交叉熵，`beta` 默认 0.40。
+
 ---
 
 ## 六、CSV 协议（两层文本）
@@ -135,3 +154,19 @@ surprise,This EEG window reflects surprised affective evidence.,,
 4. 输出目录：`/kaggle/working/eeg2text_ckpt`。
 5. 推荐数据结构：`/kaggle/input/<dataset>/{EEG_features, save_info, Emotion2text}`。
 6. 代码会优先按配置路径读取，若路径不存在会自动发现 `EEG_features`、`save_info` 和 `Emotion2text/*.csv`。
+
+---
+
+## 八、数据泄露控制
+
+1. 测试集采用 LOSO：完整留出 1 个被试。
+2. 训练/验证划分默认使用 `subject` 级切分（`val_split_mode='subject'`），确保 train/val 被试不重叠。
+3. 训练日志会打印 `subject_overlap(train,val)`，应为 `0`。
+
+---
+
+## 九、归一化与评估一致性
+
+1. 对每个被试在 `load_subject_windows` 阶段执行 Z-score 归一化（基于该被试窗口统计量）。
+2. 训练/验证/测试统一输出原型分类准确率（prototype acc）与分类头准确率（classifier acc）。
+3. 仅以训练集指标上涨而测试集不涨时，优先参考测试原型准确率判断泛化质量。
