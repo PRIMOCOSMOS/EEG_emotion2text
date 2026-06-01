@@ -416,27 +416,42 @@ def load_all_samples_with_saveinfo(data_root, saveinfo_dir=None, n_trials=80,
 # Dataset
 # --------------------------------------------------------------------------- #
 class EEGTopoDataset(Dataset):
-    """Yields (4D EEG tensor, integer label, trial id). Topographic 4D maps are
-    precomputed in __init__ for speed (vectorized per window)."""
+    """Yields {image, label, trial, subject}.
+
+    PERFORMANCE: the 4D topographic map is computed LAZILY in __getitem__
+    (on the fly) instead of materializing all windows in __init__. Only the raw
+    DE windows (5, 62) are kept (tiny), so memory stays ~O(N * 5 * 62) floats
+    instead of O(N * frames * channels * H * W) which is ~8000x larger and was
+    causing long stalls / OOM before the first epoch on Kaggle.
+
+    With DataLoader(num_workers>0) the per-window conversion runs in parallel
+    across worker processes, fully overlapping with GPU compute.
+    """
 
     def __init__(self, rows: List[Dict], image_frames: int, image_channels: int,
                  image_height: int, image_width: int):
+        self.image_frames = image_frames
+        self.image_channels = image_channels
+        self.image_height = image_height
+        self.image_width = image_width
+
         self.labels = torch.tensor([int(r["label"]) for r in rows], dtype=torch.long)
         self.trials = [int(r["trial"]) for r in rows]
         self.subjects = [str(r["subject"]) for r in rows]
-
-        imgs = np.stack([
-            de_window_to_4d(r["de"], image_frames, image_channels, image_height, image_width)
-            for r in rows
-        ], axis=0)  # (N, frames, C, H, W)
-        self.images = torch.from_numpy(imgs).to(torch.float32)
+        # keep only the raw (5,62) DE windows packed contiguously (small).
+        self.de = torch.from_numpy(
+            np.ascontiguousarray(np.stack([r["de"] for r in rows], axis=0))
+        ).to(torch.float32)  # (N, 5, 62)
 
     def __len__(self):
         return int(self.labels.shape[0])
 
     def __getitem__(self, idx):
+        de = self.de[idx].numpy()  # (5,62)
+        img = de_window_to_4d(de, self.image_frames, self.image_channels,
+                              self.image_height, self.image_width)  # (frames,C,H,W)
         return {
-            "image": self.images[idx],
+            "image": torch.from_numpy(img),
             "label": self.labels[idx],
             "trial": self.trials[idx],
             "subject": self.subjects[idx],

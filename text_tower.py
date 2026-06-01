@@ -61,14 +61,30 @@ class EmotionTextTower(nn.Module):
             p.requires_grad = False
         self.encoder.eval()
         self.clip_embed_dim = self.encoder.config.projection_dim  # 512 for ViT-B/16
+        # Pre-encoding cache: each unique prompt string is encoded by CLIP only
+        # once (reused across folds and template groups). Stored on CPU.
+        self._text_cache: Dict[str, torch.Tensor] = {}
 
     @torch.no_grad()
     def _encode(self, texts: List[str], device: torch.device) -> torch.Tensor:
-        tok = self.tokenizer(texts, padding=True, truncation=True,
-                             max_length=self.max_len, return_tensors="pt")
-        tok = {k: v.to(device) for k, v in tok.items()}
-        out = self.encoder(**tok).text_embeds  # already projected to CLIP dim
-        return out.float()
+        """Encode a list of texts to CLIP embeddings, using a per-string cache.
+
+        Only strings not seen before are sent through the (frozen) CLIP encoder;
+        results are cached on CPU so repeated prompts are essentially free.
+        """
+        missing = [t for t in texts if t not in self._text_cache]
+        if missing:
+            tok = self.tokenizer(missing, padding=True, truncation=True,
+                                 max_length=self.max_len, return_tensors="pt")
+            tok = {k: v.to(device) for k, v in tok.items()}
+            feats = self.encoder(**tok).text_embeds.float().cpu()  # (M, dim)
+            for t, f in zip(missing, feats):
+                self._text_cache[t] = f
+        out = torch.stack([self._text_cache[t] for t in texts], dim=0)
+        return out.to(device)
+
+    def clear_text_cache(self):
+        self._text_cache.clear()
 
     @torch.no_grad()
     def build_class_text_features(

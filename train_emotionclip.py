@@ -261,9 +261,18 @@ def train_one_fold(train_rows, val_rows, test_rows, fold_name, cfg, device,
         train_acc = run_correct / max(run_total, 1)
         train_loss = run_loss / max(len(train_loader), 1)
 
-        val_acc, _ = (evaluate(eeg_model, text_features, num_text_aug, val_loader, device, num_classes)
-                      if val_loader else (float("nan"), None))
-        test_acc, test_cm = evaluate(eeg_model, text_features, num_text_aug, test_loader, device, num_classes)
+        # Evaluation (val+test) roughly doubles per-epoch cost, so run it every
+        # `eval_every_n_epochs` epochs (and always on the final epoch / timeout).
+        eval_every = max(1, int(solver.get("eval_every_n_epochs", 1)))
+        is_last = (epoch + 1 == solver["num_epochs"]) or timed_out
+        do_eval = ((epoch + 1) % eval_every == 0) or is_last
+
+        if do_eval:
+            val_acc, _ = (evaluate(eeg_model, text_features, num_text_aug, val_loader, device, num_classes)
+                          if val_loader else (float("nan"), None))
+            test_acc, test_cm = evaluate(eeg_model, text_features, num_text_aug, test_loader, device, num_classes)
+        else:
+            val_acc, test_acc, test_cm = float("nan"), float("nan"), None
 
         row = {"epoch": epoch + 1, "train_loss": train_loss, "train_acc": train_acc,
                "val_acc": val_acc, "test_acc": test_acc, "global_step": global_step}
@@ -274,18 +283,20 @@ def train_one_fold(train_rows, val_rows, test_rows, fold_name, cfg, device,
         with open(history_path, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
 
+        # Only update best / patience on epochs where evaluation actually ran.
         monitor = val_acc if val_loader else test_acc
-        if not np.isnan(monitor) and monitor > best_acc:
-            best_acc = monitor
-            patience = 0
-            p, r, f1 = metrics_from_confusion(test_cm)
-            print(f"[{fold_name}]  * new best ({'val' if val_loader else 'test'}_acc={best_acc:.4f}) "
-                  f"| test mF1={np.mean(f1):.4f}")
-            _save_ckpt(best_ckpt, {"epoch": epoch + 1, "best_acc": best_acc,
-                                   "eeg_model": eeg_model.state_dict(),
-                                   "test_confusion": test_cm.tolist(), "cfg": cfg})
-        else:
-            patience += 1
+        if do_eval and not np.isnan(monitor):
+            if monitor > best_acc:
+                best_acc = monitor
+                patience = 0
+                p, r, f1 = metrics_from_confusion(test_cm)
+                print(f"[{fold_name}]  * new best ({'val' if val_loader else 'test'}_acc={best_acc:.4f}) "
+                      f"| test mF1={np.mean(f1):.4f}")
+                _save_ckpt(best_ckpt, {"epoch": epoch + 1, "best_acc": best_acc,
+                                       "eeg_model": eeg_model.state_dict(),
+                                       "test_confusion": test_cm.tolist(), "cfg": cfg})
+            else:
+                patience += 1
 
         _save_ckpt(latest_ckpt, {
             "epoch_completed": epoch, "global_step": global_step,

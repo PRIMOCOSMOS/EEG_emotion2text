@@ -73,6 +73,7 @@ def get_config(num_classes: int = 7) -> dict:
             "train_batch_size": 64,
             "val_batch_size": 64,
             "num_epochs": 100,
+            "eval_every_n_epochs": 1,            # run val+test every N epochs (speed)
             "is_early_patience": True,
             "early_patience": 30,
             "start_epoch": 0,
