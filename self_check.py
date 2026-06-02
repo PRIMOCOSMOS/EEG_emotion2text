@@ -48,58 +48,60 @@ def _skip(name, reason):
 # --------------------------------------------------------------------------- #
 # [A] Logic / fidelity checks (no data needed)
 # --------------------------------------------------------------------------- #
-def check_official_forward_formula():
-    """Our compute_class_probs must equal the official forward:
-       softmax over classes per template, then mean over templates."""
-    from train_emotionclip import compute_class_probs
+def check_class_logits_formula():
+    """compute_class_logits must return raw temperature-scaled cosine logits;
+    compute_class_probs is only a softmax wrapper for diagnostics/eval."""
+    from train_emotionclip import compute_class_logits, compute_class_probs
     B, aug, C, D = 8, 4, 3, 16
+    tau = 0.1
     emb = torch.randn(B, D)
     text = F.normalize(torch.randn(aug * C, D), dim=-1)
 
-    ours = compute_class_probs(emb, text, aug, C)
+    logits = compute_class_logits(emb, text, aug, C, temperature=tau)
+    probs = compute_class_probs(emb, text, aug, C, temperature=tau)
 
-    # reference: official trainer_entropy.py lines
-    e = emb / emb.norm(dim=-1, keepdim=True)
-    sim = e @ text.t()
-    ref = sim.view(B, aug, C).softmax(dim=-1).mean(dim=1)
+    e = F.normalize(emb, dim=-1)
+    t = F.normalize(text, dim=-1)
+    ref_logits = (e @ t.t()).view(B, aug, C).mean(dim=1) / tau
 
-    ok = torch.allclose(ours, ref, atol=1e-6)
-    _check("forward matches official (per-template softmax -> mean)", ok,
-           "max|diff|={:.2e}".format((ours - ref).abs().max().item()))
-    # probs are valid distributions
-    _check("class probs sum to 1", torch.allclose(ours.sum(1), torch.ones(B), atol=1e-5))
+    ok = torch.allclose(logits, ref_logits, atol=1e-6)
+    _check("class logits = mean cosine similarity / temperature", ok,
+           "max|diff|={:.2e}".format((logits - ref_logits).abs().max().item()))
+    _check("class probs are softmax(logits) and sum to 1",
+           torch.allclose(probs, logits.softmax(1), atol=1e-6)
+           and torch.allclose(probs.sum(1), torch.ones(B), atol=1e-5))
 
 
-def check_official_loss_and_grad():
-    """Official: CrossEntropyLoss(reduction='sum')(probs, one-hot float).
-    Verify it runs and produces non-trivial gradients."""
-    from train_emotionclip import compute_class_probs
+def check_ce_loss_and_grad():
+    """Training CE must consume RAW logits with integer labels and mean reduction."""
+    from train_emotionclip import compute_class_logits
     B, aug, C, D = 32, 4, 3, 16
     emb = torch.randn(B, D, requires_grad=True)
     text = F.normalize(torch.randn(aug * C, D), dim=-1)
     labels = torch.randint(0, C, (B,))
-    onehot = F.one_hot(labels, C).float()
 
-    probs = compute_class_probs(emb, text, aug, C)
-    loss = nn.CrossEntropyLoss(reduction="sum")(probs, onehot)
+    logits = compute_class_logits(emb, text, aug, C, temperature=0.1)
+    loss = nn.CrossEntropyLoss(reduction="mean")(logits, labels)
     loss.backward()
     g = emb.grad.norm().item()
-    _check("official CE(reduction=sum) on probs runs", torch.isfinite(loss).item(),
+    _check("CE(reduction=mean) on raw logits runs", torch.isfinite(loss).item(),
            f"loss={loss.item():.3f}")
     _check("gradient flows to EEG embedding (non-zero, finite)",
            (g > 1e-6) and math.isfinite(g), f"grad_norm={g:.4f}")
 
 
-def check_no_temperature_or_aux():
-    """Fidelity: we must NOT have added a learnable temperature or aux head
-    into the training path (those are not in the official repo)."""
+def check_temperature_config_and_no_aux():
+    """Temperature is an explicit fixed config value; no auxiliary CE head added."""
     import train_emotionclip as T
+    from config import get_config
     src = open(T.__file__).read()
-    no_scale = "logit_scale" not in src
+    cfg = get_config(label_mode="valence")
+    temp = cfg["solver"].get("temperature", None)
+    _check("fixed temperature configured in solver", isinstance(temp, (int, float)) and temp > 0,
+           f"temperature={temp}")
+    _check("no learnable logit_scale parameter in train path", "logit_scale" not in src)
     no_aux = "aux_ce_weight" not in src and "aux_logits" not in src
-    _check("no extra learnable temperature (logit_scale) in train path", no_scale)
     _check("no extra auxiliary CE head in train path", no_aux)
-
 
 def check_text_tower_frozen():
     """Fidelity: text tower must be frozen (only EEG tower trains)."""
@@ -204,15 +206,15 @@ def check_label_scheme():
 
 
 def check_no_double_count_consistency():
-    """argmax(probs) used in train/eval is consistent with official."""
-    from train_emotionclip import compute_class_probs
+    """Prediction path uses the same raw-logit formula as the training path."""
+    from train_emotionclip import compute_class_logits
     B, aug, C, D = 16, 4, 3, 16
+    tau = 0.1
     emb = torch.randn(B, D); text = F.normalize(torch.randn(aug * C, D), dim=-1)
-    probs = compute_class_probs(emb, text, aug, C)
-    e = emb / emb.norm(dim=-1, keepdim=True)
-    ref = (e @ text.t()).view(B, aug, C).softmax(-1).mean(1)
-    _check("train/eval prediction == official argmax",
-           torch.equal(probs.argmax(1), ref.argmax(1)))
+    logits = compute_class_logits(emb, text, aug, C, temperature=tau)
+    ref = (F.normalize(emb, dim=-1) @ F.normalize(text, dim=-1).t()).view(B, aug, C).mean(1) / tau
+    _check("train/eval prediction == raw-logit argmax",
+           torch.equal(logits.argmax(1), ref.argmax(1)))
 
 
 # --------------------------------------------------------------------------- #
@@ -278,7 +280,7 @@ def check_one_train_step_decreases_loss(cfg):
     from data_seedvii import (make_label_scheme, load_all_samples_with_saveinfo,
                               EEGTopoDataset, collate_fn)
     from sst_legovit import create_eeg_encoder
-    from train_emotionclip import compute_class_probs
+    from train_emotionclip import compute_class_logits
 
     cfg = discover_data_paths(cfg)
     d = cfg["data"]
@@ -302,7 +304,6 @@ def check_one_train_step_decreases_loss(cfg):
     batch = collate_fn([ds[i] for i in range(len(ds))])
     images = batch["image"].to(device)
     labels = batch["label"].to(device)
-    onehot = F.one_hot(labels, nc).float()
 
     # tiny model + fixed random normalized text anchors
     cfg["network"]["num_transformer_layers"] = [1, 1, 0]
@@ -315,16 +316,17 @@ def check_one_train_step_decreases_loss(cfg):
     anchors = F.normalize(torch.randn(nc, 512), dim=-1)
     text = anchors.repeat(16, 1).to(device)           # 16 templates x nc classes
     opt = torch.optim.AdamW(model.parameters(), lr=2e-3)
-    loss_fn = nn.CrossEntropyLoss(reduction="sum")    # official reduction
+    loss_fn = nn.CrossEntropyLoss(reduction="mean")
 
     model.train()
     losses, accs = [], []
     for _ in range(60):
-        probs = compute_class_probs(model.encode_image(images), text, 16, nc)
-        loss = loss_fn(probs, onehot)
+        logits = compute_class_logits(model.encode_image(images), text, 16, nc,
+                                      temperature=cfg["solver"].get("temperature", 0.1))
+        loss = loss_fn(logits, labels)
         opt.zero_grad(); loss.backward(); opt.step()
         losses.append(loss.item())
-        accs.append((probs.argmax(1) == labels).float().mean().item())
+        accs.append((logits.argmax(1) == labels).float().mean().item())
     # On a tiny fittable batch the loss must drop and train-acc must rise clearly.
     _check("training loss decreases (optimizer plumbing works)",
            losses[-1] < losses[0] - 1e-3, f"{losses[0]:.2f} -> {losses[-1]:.2f}")
@@ -342,8 +344,8 @@ def run_all_checks(cfg=None):
         cfg = get_config(label_mode="fine")
 
     print("\n--- [A] logic / fidelity (no data needed) ---")
-    for fn in (check_official_forward_formula, check_official_loss_and_grad,
-               check_no_temperature_or_aux, check_text_tower_frozen,
+    for fn in (check_class_logits_formula, check_ce_loss_and_grad,
+               check_temperature_config_and_no_aux, check_text_tower_frozen,
                check_de_psd_dual_stream, check_mat_robustness, check_model_io_shapes,
                check_label_scheme, check_no_double_count_consistency):
         try:

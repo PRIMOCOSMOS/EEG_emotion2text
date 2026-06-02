@@ -4,10 +4,11 @@ EmotionCLIP training / evaluation on SEED-VII.
 Technical path (Yan et al., 2025 / EmotionCLIP, official repo Departure2021/EmotionCLIP):
   * EEG tower = SST-LegoViT (trainable), produces CLIP-space embeddings.
   * Text tower = frozen CLIP text encoder with prompt ensemble (precomputed).
-  * Contrastive alignment: similarity = image_emb @ text_features.T, reshaped
-    to (B, num_text_aug, num_classes), softmax over classes, averaged across
-    templates -> probability over classes. Trained with KL (or CE) against the
-    one-hot label. Only the EEG tower is optimized.
+  * Contrastive/class-prototype alignment: normalized EEG embedding is compared
+    with frozen class text features. Similarities are reshaped to
+    (B, num_text_aug, num_classes), averaged across templates as RAW LOGITS,
+    temperature-scaled, and trained with standard mean CrossEntropyLoss.
+    Only the EEG tower is optimized.
   * Cross-subject evaluation (LOSO) over SEED-VII subjects.
 
 Protocols MIGRATED from the original repo: SEED-VII .mat loading, Saveinfo
@@ -116,29 +117,41 @@ def build_loaders(train_rows, val_rows, test_rows, cfg):
     return train_loader, val_loader, test_loader
 
 
-def compute_class_probs(image_emb, text_features, num_text_aug, num_classes):
-    """Faithful re-implementation of the OFFICIAL EmotionCLIP forward
-    (trainer_entropy.py):
+def compute_class_logits(image_emb, text_features, num_text_aug, num_classes, temperature: float = 0.1):
+    """Compute class-level raw logits for EEG -> frozen text-prototype alignment.
 
-        similarity = image_emb @ text_features.T          # [B, aug*cls]
-        similarity = similarity.view(B, aug, cls).softmax(dim=-1)  # per-template softmax
-        similarity = similarity.mean(dim=1)               # average over templates
+    IMPORTANT: this returns RAW LOGITS suitable for nn.CrossEntropyLoss.  The old
+    implementation returned per-template softmax probabilities and then fed them
+    to CrossEntropyLoss, which caused a double-softmax/probability-as-logit bug.
 
-    Returns per-class PROBABILITIES [B, num_classes]. The official code then
-    feeds THESE probabilities directly into CrossEntropyLoss(reduction="sum")
-    against one-hot labels (see train loop). We keep that exact behaviour for
-    fidelity (see MIGRATION.md section on loss).
+    Steps:
+      1) L2-normalize EEG and text embeddings -> cosine similarities.
+      2) Reshape [B, aug*num_classes] -> [B, aug, num_classes].
+      3) Average prompt-template logits.
+      4) Divide by a temperature tau to control logit sharpness.
     """
-    image_emb = image_emb / image_emb.norm(dim=-1, keepdim=True)
+    if temperature <= 0:
+        raise ValueError(f"temperature must be > 0, got {temperature}")
+    image_emb = F.normalize(image_emb, dim=-1)
+    text_features = F.normalize(text_features, dim=-1)
     sim = image_emb @ text_features.t()                              # [B, aug*cls]
-    sim = sim.view(image_emb.shape[0], num_text_aug, num_classes).softmax(dim=-1)
-    return sim.mean(dim=1)                                           # [B, num_classes] probs
+    logits = sim.view(image_emb.shape[0], num_text_aug, num_classes).mean(dim=1)
+    return logits / temperature                                      # [B, num_classes]
+
+
+def compute_class_probs(image_emb, text_features, num_text_aug, num_classes, temperature: float = 0.1):
+    """Return calibrated class probabilities from raw logits.
+
+    Kept as a convenience wrapper for evaluation/diagnostics. Training should
+    use compute_class_logits(...) + CrossEntropyLoss(labels).
+    """
+    return compute_class_logits(image_emb, text_features, num_text_aug, num_classes,
+                                temperature=temperature).softmax(dim=-1)
 
 
 @torch.no_grad()
-def evaluate(eeg_model, text_features, num_text_aug, loader, device, num_classes):
-    """Official inference (trainer_entropy._validate): average per-template
-    softmax similarity, take argmax of the resulting class probabilities."""
+def evaluate(eeg_model, text_features, num_text_aug, loader, device, num_classes, temperature: float = 0.1):
+    """Inference: raw temperature-scaled cosine logits, then argmax."""
     eeg_model.eval()
     confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
     correct, total = 0, 0
@@ -146,8 +159,9 @@ def evaluate(eeg_model, text_features, num_text_aug, loader, device, num_classes
         images = batch["image"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
         emb = eeg_model.encode_image(images)
-        probs = compute_class_probs(emb, text_features, num_text_aug, num_classes)
-        preds = probs.argmax(dim=1)
+        logits = compute_class_logits(emb, text_features, num_text_aug, num_classes,
+                                      temperature=temperature)
+        preds = logits.argmax(dim=1)
         for p, l in zip(preds.tolist(), labels.tolist()):
             confusion[l][p] += 1
             correct += int(p == l)
@@ -185,10 +199,13 @@ def train_one_fold(train_rows, val_rows, test_rows, fold_name, cfg, device,
     n_params = sum(p.numel() for p in eeg_model.parameters() if p.requires_grad) / 1e6
     print(f"[{fold_name}] EEG tower trainable params: {n_params:.3f}M")
 
-    # OFFICIAL loss (trainer_entropy.py): CrossEntropyLoss(reduction="sum") applied
-    # to the per-template-averaged softmax probabilities vs one-hot labels.
-    # (KLLoss is imported in the official repo but NOT used in its train loop.)
-    loss_fn = nn.CrossEntropyLoss(reduction="sum")
+    # Standard CE over RAW class logits.  Use mean reduction so the loss/gradient
+    # scale is independent of batch size (random 3-class baseline ~= ln(3)).
+    # The previous official-faithful path used reduction="sum" on already-softmaxed
+    # probabilities; that inflated the logged loss by batch size and caused a
+    # double-softmax/probability-as-logit training signal.
+    loss_fn = nn.CrossEntropyLoss(reduction="mean")
+    temperature = float(solver.get("temperature", 0.1))
 
     # Only the EEG image tower is optimized; the text tower is frozen (official).
     optimizer = torch.optim.AdamW(eeg_model.parameters(),
@@ -245,14 +262,12 @@ def train_one_fold(train_rows, val_rows, test_rows, fold_name, cfg, device,
                 break
             images = batch["image"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
-            labels_onehot = F.one_hot(labels, num_classes=num_classes).float()
 
             with torch.amp.autocast("cuda", enabled=(runtime["amp"] and device.type == "cuda")):
                 emb = eeg_model.encode_image(images)
-                # OFFICIAL: probabilities (per-template softmax, averaged) fed to
-                # CrossEntropyLoss(reduction="sum") against one-hot labels.
-                probs = compute_class_probs(emb, text_features, num_text_aug, num_classes)
-                loss = loss_fn(probs, labels_onehot)
+                logits = compute_class_logits(emb, text_features, num_text_aug, num_classes,
+                                              temperature=temperature)
+                loss = loss_fn(logits, labels)
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -260,8 +275,8 @@ def train_one_fold(train_rows, val_rows, test_rows, fold_name, cfg, device,
             scaler.update()
             global_step += 1
 
-            run_loss += loss.item()
-            preds = probs.argmax(dim=1)
+            run_loss += loss.item() * labels.shape[0]
+            preds = logits.argmax(dim=1)
             run_correct += (preds == labels).sum().item()
             run_total += labels.shape[0]
 
@@ -274,7 +289,7 @@ def train_one_fold(train_rows, val_rows, test_rows, fold_name, cfg, device,
 
         scheduler.step()
         train_acc = run_correct / max(run_total, 1)
-        train_loss = run_loss / max(len(train_loader), 1)
+        train_loss = run_loss / max(run_total, 1)
 
         # Evaluation (val+test) roughly doubles per-epoch cost, so run it every
         # `eval_every_n_epochs` epochs (and always on the final epoch / timeout).
@@ -283,9 +298,11 @@ def train_one_fold(train_rows, val_rows, test_rows, fold_name, cfg, device,
         do_eval = ((epoch + 1) % eval_every == 0) or is_last
 
         if do_eval:
-            val_acc, _ = (evaluate(eeg_model, text_features, num_text_aug, val_loader, device, num_classes)
+            val_acc, _ = (evaluate(eeg_model, text_features, num_text_aug, val_loader, device, num_classes,
+                                   temperature=temperature)
                           if val_loader else (float("nan"), None))
-            test_acc, test_cm = evaluate(eeg_model, text_features, num_text_aug, test_loader, device, num_classes)
+            test_acc, test_cm = evaluate(eeg_model, text_features, num_text_aug, test_loader, device, num_classes,
+                                         temperature=temperature)
         else:
             val_acc, test_acc, test_cm = float("nan"), float("nan"), None
 
