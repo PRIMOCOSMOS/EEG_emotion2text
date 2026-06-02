@@ -64,10 +64,10 @@ def get_config(num_classes: int = None, label_mode: str = "fine") -> dict:
             "tubelet_channels": 1,
             "tubelet_height": 16,
             "tubelet_width": 16,
-            "num_transformer_layers": [2, 2, 0], # [spatial, spectral, temporal] = official SEED yaml
-            "embed_dims": 128,
+            "num_transformer_layers": [1, 1, 0], # [spatial, spectral, temporal] = official SEED yaml
+            "embed_dims": 64,
             "num_heads": 4,
-            "multi_conv2d_hidden_dims": 128,
+            "multi_conv2d_hidden_dims": 64,
             "spatial_type": "Multi_Conv2D",
             "spectral_type": "Legoformer",
             "temporal_type": "Transformer",
