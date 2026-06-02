@@ -96,7 +96,7 @@ def get_config(num_classes: int = None, label_mode: str = "fine") -> dict:
             # Contrastive/class-prototype logits temperature.  We now train with
             # raw cosine-similarity logits (not already-softmaxed probabilities),
             # then divide by tau before CrossEntropyLoss.  0.07~0.2 is typical.
-            "temperature": 0.1,
+            "temperature": 0.5,
             "eval_every_n_epochs": 1,            # run val+test every N epochs (speed)
             "is_early_patience": True,
             "early_patience": 30,
