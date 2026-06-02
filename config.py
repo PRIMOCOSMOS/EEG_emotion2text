@@ -3,24 +3,23 @@ Central configuration for the EmotionCLIP (SST-LegoViT + frozen CLIP) pipeline
 on SEED-VII.
 
 Mirrors the reference configs/SEED_train.yaml structure, but adapted to:
-  * SEED-VII (7 emotion classes by default),
-  * the migrated SEED-VII .mat / Saveinfo / two-level-text CSV protocols,
-  * HuggingFace CLIP (offline-cacheable),
-  * Kaggle resume + time-budget support (ported from the original repo).
+ * SEED-VII (7 emotion classes by default),
+ * the migrated SEED-VII .mat / Saveinfo / two-level-text CSV protocols,
+ * HuggingFace CLIP (offline-cacheable),
+ * Kaggle resume + time-budget support (ported from the original repo).
 """
 
 import os
 from copy import deepcopy
 
-
 def get_config(num_classes: int = None, label_mode: str = "fine") -> dict:
     """Build the default config.
 
     label_mode:
-        "fine"    -> 7-class SEED-VII emotions (neutral/joy/sadness/fear/
-                     disgust/anger/surprise).
-        "valence" -> 3-class valence aggregation (negative/neutral/positive),
-                     derived from the 7 emotions (see data_seedvii.VALENCE_GROUPS).
+      "fine"     -> 7-class SEED-VII emotions (neutral/joy/sadness/fear/
+                    disgust/anger/surprise).
+      "valence"  -> 3-class valence aggregation (negative/neutral/positive),
+                    derived from the 7 emotions (see data_seedvii.VALENCE_GROUPS).
 
     num_classes is normally inferred from label_mode (7 or 3). You may still pass
     it explicitly to override (e.g. for SEED-IV=4 / SEED=3 fine-grained sets),
@@ -34,44 +33,44 @@ def get_config(num_classes: int = None, label_mode: str = "fine") -> dict:
         "random_seed": 42,
         "multi_gpu": True,
 
-        # ----- data / paths (SEED-VII protocol, ported) -----
+        # ------ data / paths (SEED-VII protocol, ported) -----
         "data": {
             "dataset": "SEED-VII",
-            "num_classes": num_classes,          # auto: 7 (fine) / 3 (valence)
-            "label_mode": label_mode,            # "fine" | "valence"
-            "valence_groups": None,              # None=default mapping; or {neg/neu/pos: [...]}
+            "num_classes": num_classes,  # auto: 7 (fine) / 3 (valence)
+            "label_mode": label_mode,    # "fine" | "valence"
+            "valence_groups": None,      # None=default mapping; or {neg/neu/pos: [...]}
             "n_trials": 80,
-            "num_shot": 0,                       # few-shot from target subject (0 = zero-shot)
+            "num_shot": 0,               # few-shot from target subject (0 = zero-shot)
             "data_root": "/kaggle/input/datasets/primocosmos/seed-vii-kaggle/EEG_features",
             "saveinfo_dir": "/kaggle/input/datasets/primocosmos/seed-vii-kaggle/save_info",
             "text_csv_path": "/kaggle/input/datasets/primocosmos/seed-vii-kaggle/Emotion2text/text_protocol_template.csv",
             "val_ratio": 0.1,
-            "val_split_mode": "subject",         # "subject" | "window"
+            "val_split_mode": "subject", # "subject" | "window"
             "normalize_subject_zscore": True,
-            "use_l2_extra_prompts": True,        # migrate CSV L2 trial text as extra prompts
-            "de_key": "de_LDS",                  # "de_LDS" (LDS-smoothed, recommended) | "de" (raw)
-            "use_psd": True,                     # True -> real DE+PSD dual-stream (SEED-VII has psd_i)
+            "use_l2_extra_prompts": True, # migrate CSV L2 trial text as extra prompts
+            "de_key": "de_LDS",           # "de_LDS" (LDS-smoothed, recommended) | "de" (raw)
+            "use_psd": True,              # True -> real DE+PSD dual-stream (SEED-VII has psd_i)
             "workers": 2,
         },
 
-        # ----- 4D topographic input + SST-LegoViT network -----
+        # ------ 4D topographic input + SST-LegoViT network -----
         "network": {
             "image_frames": 4,
-            "image_channels": 10,                # 5 DE bands duplicated to 10 (DE/PSD slots)
+            "image_channels": 10,         # 5 DE bands duplicated to 10 (DE/PSD slots)
             "image_height": 64,
             "image_width": 64,
             "tubelet_frames": 1,
             "tubelet_channels": 1,
             "tubelet_height": 16,
             "tubelet_width": 16,
-            "num_transformer_layers": [1, 1, 0], # [spatial, spectral, temporal] = official SEED yaml
+            "num_transformer_layers": [1, 1, 0],  # [spatial, spectral, temporal] = official SEED yaml
             "embed_dims": 64,
             "num_heads": 4,
             "multi_conv2d_hidden_dims": 64,
             "spatial_type": "Multi_Conv2D",
             "spectral_type": "Legoformer",
             "temporal_type": "Transformer",
-            "attn_dropout": 0.3,                  # official SEED_train.yaml values below
+            "attn_dropout": 0.3,          # official SEED_train.yaml values below
             "attn_proj_dropout": 0.3,
             "ffn_proj_dropout": 0.4,
             "multi_conv_dropout": 0.3,
@@ -79,50 +78,65 @@ def get_config(num_classes: int = None, label_mode: str = "fine") -> dict:
             "dropout_after_pos_embed": 0.3,
             "conv_type": "Conv_Stem",
             "use_spectral_pos_embedding": True,
-            "clip_embed_dim": 512,               # must match CLIP text projection dim
+            "clip_embed_dim": 512,        # must match CLIP text projection dim
         },
 
-        # ----- text tower -----
+        # ------ text tower -----
         "text": {
             "clip_name": "openai/clip-vit-base-patch16",
             "max_text_len": 64,
         },
 
-        # ----- optimization -----
+        # ------ optimization -----
         "solver": {
-            "train_batch_size": 512,
+            # *** Contrastive Learning Configuration ***
+            # When use_contrastive_loss=True, the model uses Supervised Contrastive Loss
+            # with BalancedBatchSampler for strict per-class balanced batches.
+            # train_batch_size MUST be divisible by num_classes (7 or 3).
+            # Recommended: 7-class -> 504 (72/class), 3-class -> 510 (170/class)
+            "train_batch_size": 504,
             "val_batch_size": 512,
             "num_epochs": 100,
-            # Contrastive/class-prototype logits temperature.  We now train with
-            # raw cosine-similarity logits (not already-softmaxed probabilities),
-            # then divide by tau before CrossEntropyLoss.  0.07~0.2 is typical.
+
+            # Joint Loss Configuration: CE + Supervised Contrastive
+            # L_total = alpha * L_ce + (1 - alpha) * L_supcon
+            # alpha=1.0 -> pure CE (original behavior)
+            # alpha=0.0 -> pure SupCon
+            # alpha=0.5 -> balanced joint loss (recommended)
+            "use_contrastive_loss": True,
+            "ce_supcon_alpha": 0.5,
+
+            # SupCon temperature (typically 0.05~0.1)
+            "contrastive_temperature": 0.07,
+
+            # CE temperature (used for logits computation & eval)
             "temperature": 0.5,
-            "eval_every_n_epochs": 1,            # run val+test every N epochs (speed)
+
+            "eval_every_n_epochs": 1,   # run val+test every N epochs (speed)
             "is_early_patience": True,
             "early_patience": 30,
             "start_epoch": 0,
             "lr_type": "Cosine",
-            "lr": 1e-4,                          # official SEED_train.yaml
+            "lr": 1e-4,                 # official SEED_train.yaml
             "lr_warmup_step": 5,
             "momentum": 0.9,
-            "weight_decay": 0.12,               # official SEED_train.yaml
+            "weight_decay": 0.12,       # official SEED_train.yaml
             "optim": "AdamW",
         },
 
-        # ----- runtime / Kaggle (ported) -----
+        # ------ runtime / Kaggle (ported) -----
         "runtime": {
             "work_dir": "/kaggle/working/emotionclip_ckpt",
             "resume": True,
             "save_every_n_steps": 100,
             "max_train_hours": 8.8,
             "time_buffer_minutes": 8,
-            "amp": True,                         # mixed precision (faster on GPU; ignored on CPU)
+            "amp": True,                # mixed precision (faster on GPU; ignored on CPU)
             "log_every_n_steps": 20,
-            "run_all_folds": False,              # False = only first LOSO fold
+            "run_all_folds": False,     # False = only first LOSO fold
         },
     }
     return cfg
-
 
 def discover_data_paths(cfg: dict) -> dict:
     """Kaggle path auto-discovery (ported from the original repo)."""
@@ -153,8 +167,8 @@ def discover_data_paths(cfg: dict) -> dict:
                     cands.extend(sorted(emo_dir.glob("*.csv")))
                 cands.extend(sorted(parent.rglob("text_protocol*.csv")))
             # 2) Global fallback: search ALL mounted datasets. This covers the
-            #    case where the code + CSV live in a SEPARATE Kaggle dataset from
-            #    the EEG data. We match the known protocol filename pattern.
+            # case where the code + CSV live in a SEPARATE Kaggle dataset from
+            # the EEG data. We match the known protocol filename pattern.
             if not cands:
                 cands.extend(sorted(input_root.rglob("text_protocol*.csv")))
             if not cands:

@@ -150,7 +150,7 @@ class LabelScheme:
             return f"LabelScheme(mode=fine, {self.num_classes} classes: {self.names})"
         grp = {v: self.valence_groups[v] for v in VALENCE_NAMES}
         return (f"LabelScheme(mode=valence, {self.num_classes} classes: {self.names}; "
-                f"groups={grp})")
+                f"groups={grp}")
 
 
 def make_label_scheme(cfg_data: dict) -> "LabelScheme":
@@ -515,7 +515,7 @@ def feat_window_to_4d(de_window: np.ndarray, image_frames: int, image_channels: 
     bands x 62 electrodes). To match the official EmotionCLIP "DE_PSD" input
     (image_channels=10) we build the spectral/channel axis as:
 
-        [ DE_band0..DE_band4 , PSD_band0..PSD_band4 ]   (DE first, PSD second)
+    [ DE_band0..DE_band4 , PSD_band0..PSD_band4 ] (DE first, PSD second)
 
     This ordering is intentional: the Legoformer dual-stream splits the channel
     axis in half (`x[:, :C//2]` = DE stream, `x[:, C//2:]` = PSD stream), so the
@@ -534,14 +534,14 @@ def feat_window_to_4d(de_window: np.ndarray, image_frames: int, image_channels: 
     """
     size = (image_width, image_height)
     de_maps = np.stack([_band_vector_to_2d(de_window[b], size)
-                        for b in range(de_window.shape[0])], axis=0)   # (5,H,W)
+                        for b in range(de_window.shape[0])], axis=0)  # (5,H,W)
 
     if use_psd and psd_window is not None:
         psd_maps = np.stack([_band_vector_to_2d(psd_window[b], size)
                              for b in range(psd_window.shape[0])], axis=0)  # (5,H,W)
-        chan = np.concatenate([de_maps, psd_maps], axis=0)            # (10,H,W) DE|PSD
+        chan = np.concatenate([de_maps, psd_maps], axis=0)  # (10,H,W) DE|PSD
     else:
-        chan = de_maps                                                # (5,H,W)
+        chan = de_maps  # (5,H,W)
 
     # Fit to requested image_channels (truncate or tile to be safe).
     if chan.shape[0] >= image_channels:
@@ -550,7 +550,7 @@ def feat_window_to_4d(de_window: np.ndarray, image_frames: int, image_channels: 
         reps = int(np.ceil(image_channels / chan.shape[0]))
         chan = np.concatenate([chan] * reps, axis=0)[:image_channels]
 
-    frames = np.repeat(chan[np.newaxis, ...], image_frames, axis=0)   # (frames,C,H,W)
+    frames = np.repeat(chan[np.newaxis, ...], image_frames, axis=0)  # (frames,C,H,W)
     return frames.astype(np.float32)
 
 
@@ -767,3 +767,73 @@ def split_train_val(rows, val_ratio=0.1, seed=42):
     train_rows = [r for i, r in enumerate(rows) if i not in val_idx]
     val_rows = [r for i, r in enumerate(rows) if i in val_idx]
     return train_rows, val_rows
+
+
+# --------------------------------------------------------------------------- #
+# Balanced Batch Sampler (NEW: for Supervised Contrastive Learning)
+# --------------------------------------------------------------------------- #
+class BalancedBatchSampler:
+    """Strictly balanced batch sampler for supervised contrastive learning.
+
+    Guarantees every batch contains exactly `samples_per_class` samples from
+    each class. This ensures:
+    1. Every batch has a balanced class distribution matching the active
+       label scheme (fine=7 or valence=3).
+    2. Each sample has enough positive pairs for stable SupCon gradients.
+    3. Eliminates random batch-to-batch class fluctuations that cause
+       gradient dominance by majority classes.
+
+    Requirements:
+    - batch_size MUST be divisible by num_classes
+    - Each class MUST have >= samples_per_class training examples
+    """
+
+    def __init__(self, labels, batch_size, num_classes):
+        self.labels = np.array(labels)
+        self.batch_size = batch_size
+        self.num_classes = num_classes
+
+        assert batch_size % num_classes == 0, (
+            f"batch_size ({batch_size}) must be divisible by num_classes ({num_classes}). "
+            f"For 7-class use multiples of 7 (e.g. 504=72*7). "
+            f"For 3-class valence use multiples of 3 (e.g. 510=170*3)."
+        )
+        self.samples_per_class = batch_size // num_classes
+
+        # Verify each class has enough samples for at least one batch
+        for c in range(num_classes):
+            count = int(np.sum(self.labels == c))
+            if count < self.samples_per_class:
+                raise ValueError(
+                    f"Class {c} has only {count} samples, "
+                    f"need at least samples_per_class={self.samples_per_class}. "
+                    f"Reduce batch_size or check label distribution."
+                )
+
+        # Number of complete batches we can form
+        min_per_class = min(int(np.sum(self.labels == c)) for c in range(num_classes))
+        self.n_batches = min_per_class // self.samples_per_class
+
+    def __iter__(self):
+        # Build per-class index pools
+        indices = {}
+        for c in range(self.num_classes):
+            indices[c] = np.where(self.labels == c)[0].tolist()
+
+        rng = np.random.default_rng()
+
+        for _ in range(self.n_batches):
+            batch = []
+            for c in range(self.num_classes):
+                # Shuffle this class's pool and take samples_per_class
+                rng.shuffle(indices[c])
+                batch.extend(indices[c][:self.samples_per_class])
+                # Remove taken indices
+                indices[c] = indices[c][self.samples_per_class:]
+
+            # Shuffle the entire batch so the model doesn't learn positional bias
+            rng.shuffle(batch)
+            yield batch
+
+    def __len__(self):
+        return self.n_batches

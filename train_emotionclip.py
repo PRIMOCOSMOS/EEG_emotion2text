@@ -36,6 +36,7 @@ from data_seedvii import (
     load_all_samples_with_saveinfo, load_two_level_texts_from_csv,
     build_subject_label_map_from_saveinfo, build_default_l2_texts,
     EEGTopoDataset, collate_fn, split_train_val, split_train_val_by_subject,
+    BalancedBatchSampler,
 )
 from sst_legovit import create_eeg_encoder
 from text_tower import EmotionTextTower, KLLoss, build_extra_class_prompts_from_l2
@@ -95,6 +96,47 @@ def _load_ckpt(path):
 
 
 # --------------------------------------------------------------------------- #
+# Supervised Contrastive Loss (NEW)
+# --------------------------------------------------------------------------- #
+def supervised_contrastive_loss(features, labels, temperature=0.07):
+    """Supervised Contrastive Loss (SupCon).
+
+    Enforces:
+    - Same emotion (even from different subjects) = positive pair (attract)
+    - Different emotion (even from same subject)  = negative pair (repel)
+
+    Automatically adapts to the active label scheme (fine=7 or valence=3).
+
+    Args:
+        features: [B, D] L2-normalized embeddings from the EEG tower
+        labels:   [B]    integer class labels (already mapped to active scheme)
+        temperature: scaling factor (typically 0.05~0.1)
+    """
+    # features should already be L2-normalized by the caller
+    # Compute pairwise cosine similarity matrix [B, B]
+    sim_matrix = features @ features.T / temperature
+
+    # Positive mask: same class AND not self
+    labels = labels.unsqueeze(1)
+    pos_mask = (labels == labels.T).float()
+    pos_mask.fill_diagonal_(0.0)  # exclude self
+
+    # Numerically stable denominator: log-sum-exp over all negatives+positives
+    logits_mask = sim_matrix.clone()
+    logits_mask.fill_diagonal_(float('-inf'))
+    log_denom = torch.logsumexp(logits_mask, dim=1)
+
+    # Numerator: sum of positive similarities
+    pos_logits_sum = (sim_matrix * pos_mask).sum(dim=1)
+    pos_counts = pos_mask.sum(dim=1)
+    pos_counts = torch.clamp(pos_counts, min=1.0)  # prevent division by zero
+
+    # Loss = - mean(log( exp(sim_pos) / sum(exp(sim_all)) ))
+    loss_per_sample = (pos_logits_sum / pos_counts) - log_denom
+    return -loss_per_sample.mean()
+
+
+# --------------------------------------------------------------------------- #
 def build_loaders(train_rows, val_rows, test_rows, cfg):
     n = cfg["network"]
     args = dict(image_frames=n["image_frames"], image_channels=n["image_channels"],
@@ -107,8 +149,24 @@ def build_loaders(train_rows, val_rows, test_rows, cfg):
     nw = cfg["data"]["workers"]
     extra = {"prefetch_factor": 4, "persistent_workers": True} if nw > 0 else {}
 
-    train_loader = DataLoader(train_ds, batch_size=cfg["solver"]["train_batch_size"], shuffle=True,
-                              num_workers=nw, pin_memory=pin, collate_fn=collate_fn, drop_last=True, **extra)
+    use_contrastive = cfg["solver"].get("use_contrastive_loss", False)
+    batch_size = cfg["solver"]["train_batch_size"]
+
+    if use_contrastive:
+        # BalancedBatchSampler guarantees strict per-class balance in every batch.
+        train_labels = [int(r["label"]) for r in train_rows]
+        num_classes = cfg["data"]["num_classes"]
+        sampler = BalancedBatchSampler(train_labels, batch_size, num_classes)
+        train_loader = DataLoader(train_ds, batch_sampler=sampler,
+                                  num_workers=nw, pin_memory=pin, collate_fn=collate_fn, **extra)
+        print(f"[LOADER] BalancedBatchSampler: batch_size={batch_size}, "
+              f"samples_per_class={batch_size // num_classes}, "
+              f"n_batches={len(sampler)}")
+    else:
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                                  num_workers=nw, pin_memory=pin, collate_fn=collate_fn,
+                                  drop_last=True, **extra)
+
     val_loader = (DataLoader(val_ds, batch_size=cfg["solver"]["val_batch_size"], shuffle=False,
                              num_workers=nw, pin_memory=pin, collate_fn=collate_fn, **extra)
                   if val_ds else None)
@@ -199,13 +257,22 @@ def train_one_fold(train_rows, val_rows, test_rows, fold_name, cfg, device,
     n_params = sum(p.numel() for p in eeg_model.parameters() if p.requires_grad) / 1e6
     print(f"[{fold_name}] EEG tower trainable params: {n_params:.3f}M")
 
-    # Standard CE over RAW class logits.  Use mean reduction so the loss/gradient
-    # scale is independent of batch size (random 3-class baseline ~= ln(3)).
-    # The previous official-faithful path used reduction="sum" on already-softmaxed
-    # probabilities; that inflated the logged loss by batch size and caused a
-    # double-softmax/probability-as-logit training signal.
-    loss_fn = nn.CrossEntropyLoss(reduction="mean")
-    temperature = float(solver.get("temperature", 0.1))
+    # --- Loss function: Joint CE + Supervised Contrastive ---
+    use_contrastive = solver.get("use_contrastive_loss", False)
+    alpha = float(solver.get("ce_supcon_alpha", 0.5))  # CE weight; (1-alpha) = SupCon weight
+    ce_loss_fn = nn.CrossEntropyLoss(reduction="mean")
+    eval_temperature = float(solver.get("temperature", 0.1))
+    supcon_temperature = float(solver.get("contrastive_temperature", 0.07))
+
+    if use_contrastive:
+        print(f"[*] Joint Loss: L = {alpha:.2f} * CE + {1 - alpha:.2f} * SupCon")
+        print(f"[*] CE temperature = {eval_temperature}, SupCon temperature = {supcon_temperature}")
+        if alpha == 1.0:
+            print("[*] Warning: alpha=1.0 => pure CE, SupCon disabled despite use_contrastive_loss=True")
+        elif alpha == 0.0:
+            print("[*] Warning: alpha=0.0 => pure SupCon, CE disabled")
+    else:
+        print(f"[*] Using CrossEntropy Loss only (tau={eval_temperature})")
 
     # Only the EEG image tower is optimized; the text tower is frozen (official).
     optimizer = torch.optim.AdamW(eeg_model.parameters(),
@@ -265,9 +332,21 @@ def train_one_fold(train_rows, val_rows, test_rows, fold_name, cfg, device,
 
             with torch.amp.autocast("cuda", enabled=(runtime["amp"] and device.type == "cuda")):
                 emb = eeg_model.encode_image(images)
-                logits = compute_class_logits(emb, text_features, num_text_aug, num_classes,
-                                              temperature=temperature)
-                loss = loss_fn(logits, labels)
+
+                if use_contrastive:
+                    # Joint Loss: L = alpha * L_ce + (1 - alpha) * L_supcon
+                    features_norm = F.normalize(emb, dim=-1)
+                    logits = compute_class_logits(emb, text_features, num_text_aug, num_classes,
+                                                  temperature=eval_temperature)
+                    loss_ce = ce_loss_fn(logits, labels)
+                    loss_supcon = supervised_contrastive_loss(features_norm, labels,
+                                                               temperature=supcon_temperature)
+                    loss = alpha * loss_ce + (1 - alpha) * loss_supcon
+                else:
+                    # Standard CE only
+                    logits = compute_class_logits(emb, text_features, num_text_aug, num_classes,
+                                                  temperature=eval_temperature)
+                    loss = ce_loss_fn(logits, labels)
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -275,7 +354,12 @@ def train_one_fold(train_rows, val_rows, test_rows, fold_name, cfg, device,
             scaler.update()
             global_step += 1
 
+            # --- Metrics tracking (compatible with both loss modes) ---
             run_loss += loss.item() * labels.shape[0]
+            if use_contrastive:
+                # In joint mode, also log per-component losses for diagnostics
+                run_loss_ce = loss_ce.item() * labels.shape[0]
+                run_loss_supcon = loss_supcon.item() * labels.shape[0]
             preds = logits.argmax(dim=1)
             run_correct += (preds == labels).sum().item()
             run_total += labels.shape[0]
@@ -291,6 +375,14 @@ def train_one_fold(train_rows, val_rows, test_rows, fold_name, cfg, device,
         train_acc = run_correct / max(run_total, 1)
         train_loss = run_loss / max(run_total, 1)
 
+        # Log per-component losses in joint mode for monitoring
+        if use_contrastive:
+            avg_loss_ce = run_loss_ce / max(run_total, 1)
+            avg_loss_supcon = run_loss_supcon / max(run_total, 1)
+        else:
+            avg_loss_ce = train_loss
+            avg_loss_supcon = float('nan')
+
         # Evaluation (val+test) roughly doubles per-epoch cost, so run it every
         # `eval_every_n_epochs` epochs (and always on the final epoch / timeout).
         eval_every = max(1, int(solver.get("eval_every_n_epochs", 1)))
@@ -299,18 +391,24 @@ def train_one_fold(train_rows, val_rows, test_rows, fold_name, cfg, device,
 
         if do_eval:
             val_acc, _ = (evaluate(eeg_model, text_features, num_text_aug, val_loader, device, num_classes,
-                                   temperature=temperature)
+                                   temperature=eval_temperature)
                           if val_loader else (float("nan"), None))
             test_acc, test_cm = evaluate(eeg_model, text_features, num_text_aug, test_loader, device, num_classes,
-                                         temperature=temperature)
+                                         temperature=eval_temperature)
         else:
             val_acc, test_acc, test_cm = float("nan"), float("nan"), None
 
         row = {"epoch": epoch + 1, "train_loss": train_loss, "train_acc": train_acc,
-               "val_acc": val_acc, "test_acc": test_acc, "global_step": global_step}
+               "val_acc": val_acc, "test_acc": test_acc, "global_step": global_step,
+               "train_loss_ce": avg_loss_ce, "train_loss_supcon": avg_loss_supcon}
         history.append(row)
-        print(f"[{fold_name}] E{epoch+1:03d} | loss={train_loss:.4f} "
-              f"train_acc={train_acc:.4f} val_acc={val_acc:.4f} test_acc={test_acc:.4f}")
+        if use_contrastive:
+            print(f"[{fold_name}] E{epoch+1:03d} | loss={train_loss:.4f} "
+                  f"ce={avg_loss_ce:.4f} supcon={avg_loss_supcon:.4f} "
+                  f"train_acc={train_acc:.4f} val_acc={val_acc:.4f} test_acc={test_acc:.4f}")
+        else:
+            print(f"[{fold_name}] E{epoch+1:03d} | loss={train_loss:.4f} "
+                  f"train_acc={train_acc:.4f} val_acc={val_acc:.4f} test_acc={test_acc:.4f}")
 
         with open(history_path, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
